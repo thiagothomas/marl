@@ -3,7 +3,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 
 class GridWorldBase(gym.Env):
@@ -52,6 +52,8 @@ class GridWorldBase(gym.Env):
         self.agent_pos = None
         self.goal_pos = None
         self.steps_taken = 0
+        self.obstacles: List[Tuple[int, int]] = self._define_obstacles()
+        self._obstacle_set = {tuple(pos) for pos in self.obstacles}
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict]:
         """Reset the environment to initial state.
@@ -65,14 +67,20 @@ class GridWorldBase(gym.Env):
         # Set goal position first (defined in subclasses)
         self._set_goal_position()
 
-        # Start agent at random position (but not on the goal)
+        if tuple(self.goal_pos) in self._obstacle_set:
+            raise ValueError("Goal position cannot overlap with an obstacle")
+
+        # Start agent at random position (but not on the goal or obstacles)
         while True:
             random_x = self.np_random.integers(0, self.size)
             random_y = self.np_random.integers(0, self.size)
             self.agent_pos = np.array([random_x, random_y], dtype=np.int32)
 
-            # Make sure we don't start on the goal
-            if not np.array_equal(self.agent_pos, self.goal_pos):
+            # Make sure we don't start on the goal or an obstacle
+            if (
+                not np.array_equal(self.agent_pos, self.goal_pos)
+                and (random_x, random_y) not in self._obstacle_set
+            ):
                 break
 
         self.steps_taken = 0
@@ -99,11 +107,18 @@ class GridWorldBase(gym.Env):
             truncated: Whether episode is truncated (max steps)
             info: Additional information
         """
+        previous_pos = self.agent_pos.copy()
+
         # Move agent
         new_pos = self.agent_pos + self.actions[action]
 
         # Clip to grid boundaries
         new_pos = np.clip(new_pos, 0, self.size - 1)
+
+        # Prevent moving into obstacles
+        if (new_pos[0], new_pos[1]) in self._obstacle_set:
+            new_pos = previous_pos
+
         self.agent_pos = new_pos
 
         self.steps_taken += 1
@@ -120,7 +135,9 @@ class GridWorldBase(gym.Env):
         if self.render_mode == 'console':
             self.render()
 
-        return self.agent_pos.copy(), reward, terminated, truncated, {}
+        return self.agent_pos.copy(), reward, terminated, truncated, {
+            'obstacles': list(self.obstacles)
+        }
 
     def _calculate_reward(self) -> float:
         """Calculate reward for current state. Must be overridden by subclasses."""
@@ -134,6 +151,10 @@ class GridWorldBase(gym.Env):
         """Render the environment to console."""
         if self.render_mode == 'console':
             grid = np.full((self.size, self.size), '.')
+
+            for ox, oy in self.obstacles:
+                grid[oy, ox] = '#'
+
             grid[self.goal_pos[1], self.goal_pos[0]] = 'G'
             grid[self.agent_pos[1], self.agent_pos[0]] = 'A'
 
@@ -142,3 +163,32 @@ class GridWorldBase(gym.Env):
                 print(' '.join(row))
             print("=" * (self.size * 2 + 1))
             print(f"Steps: {self.steps_taken}/{self.max_steps}")
+
+    def _define_obstacles(self) -> List[Tuple[int, int]]:
+        """Define static obstacles that force detours toward each corner goal."""
+        mid = self.size // 2
+        obstacles: List[Tuple[int, int]] = []
+
+        # Vertical barrier with a central gap
+        for y in range(1, self.size - 1):
+            if y == mid:
+                continue
+            obstacles.append((mid, y))
+
+        # Horizontal barrier with openings at the far edges
+        for x in range(1, self.size - 1):
+            if x == mid:
+                continue
+            obstacles.append((x, mid))
+
+        # Offset blocks to differentiate diagonal paths
+        extras = [
+            (mid - 1, 1),
+            (mid + 1, self.size - 2)
+        ]
+
+        for pos in extras:
+            if 0 <= pos[0] < self.size and 0 <= pos[1] < self.size:
+                obstacles.append(pos)
+
+        return obstacles

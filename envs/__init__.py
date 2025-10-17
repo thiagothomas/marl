@@ -5,15 +5,15 @@ from .grid_world import GridWorldBase
 from .multi_agent_grid_world import (
     MultiAgentGridWorld,
     TwoTeamsSingleAgent,
-    TwoTeamsDoubleAgents
+    TwoTeamsDoubleAgents,
+    DEFAULT_INITIAL_POSITION_PRESETS
 )
 
 from .team_goal_environments import (
     TeamGoalTopRight,
     TeamGoalTopLeft,
     TeamGoalBottomLeft,
-    TeamGoalBottomRight,
-    TeamGoalCenter
+    TeamGoalBottomRight
 )
 
 __all__ = [
@@ -21,9 +21,9 @@ __all__ = [
     'MultiAgentGridWorld',
     'TwoTeamsSingleAgent',
     'TwoTeamsDoubleAgents',
+    'DEFAULT_INITIAL_POSITION_PRESETS',
     'TeamGoalTopRight',
     'TeamGoalTopLeft',
     'TeamGoalBottomLeft',
-    'TeamGoalBottomRight',
-    'TeamGoalCenter'
+    'TeamGoalBottomRight'
 ]

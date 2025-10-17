@@ -80,12 +80,11 @@ This will train models (if needed) and let you interactively test multi-agent re
 python train.py --episodes 5000
 ```
 
-This trains 5 policies (one per team goal):
+This trains 4 policies (one per team goal):
 - `team_goal_top_right`
 - `team_goal_top_left`
 - `team_goal_bottom_left`
 - `team_goal_bottom_right`
-- `team_goal_center`
 
 Options:
 - `--episodes`: Training episodes per agent (default: 5000)
@@ -127,15 +126,18 @@ Interactive visualizer that shows:
 - **Size**: 7×7 grid
 - **Teams**: Configurable (e.g., 2 teams)
 - **Team sizes**: Configurable (e.g., [1, 1] or [2, 2])
-- **Goals**: Each team assigned a corner or center position
+- **Goals**: Each team assigned a distinct corner objective
+- **Obstacles**: Static cross-shaped barriers with offset blocks that force detours
+- **Initial positions**: Canonical spawn presets (e.g., agents targeting top-right/top-left start at (1, 6) and (5, 6)) ensure reproducible comparisons; override via `initial_agent_positions` or switch presets with `start_preset` for custom scenarios
 - **Observability**: Full (all agents see all positions)
+
+The presets exposed through `envs.DEFAULT_INITIAL_POSITION_PRESETS` cover common two-team layouts; add more (or pass explicit `initial_agent_positions` / adjust `start_preset`) to investigate additional initial-state/goal pairs.
 
 ### Team Goals
 1. **top_right**: Reach position (6, 0)
 2. **top_left**: Reach position (0, 0)
 3. **bottom_left**: Reach position (0, 6)
 4. **bottom_right**: Reach position (6, 6)
-5. **center**: Reach position (3, 3)
 
 ### Observation Space
 Each agent observes a flat array of all agent positions:
@@ -176,6 +178,21 @@ For N agents and M teams with specified sizes:
 - **KL Divergence** (primary): Measures policy distribution difference
 - **Cross-Entropy**: Negative log-likelihood of observed actions
 - **Mean Action Distance**: Simple action matching
+
+### Latency Reporting
+
+In addition to accuracy, the CLI demo and recognition scripts now report how many observations were required to lock onto the correct goals and team assignments (goal/team/joint lock-in). Use these ratios (e.g., `goal lock-in: 12/30`) to judge convergence speed under the obstacle maze.
+
+### Command Cheat Sheet
+
+- `pip install -r requirements.txt` – install the Python dependencies (PyTorch, Gymnasium, NumPy, PyQt6) into your active environment.
+- `python train.py --episodes 5000 [--device cuda]` – train the four corner-reaching policies. Training still samples random non-obstacle starting cells so the policies generalise across corridors.
+- `python recognize.py --episodes 5000 --scenario 0 [--metric kl_divergence]` – run all recognition scenarios sequentially using the deterministic multi-agent spawn presets (Scenario 0 ≡ Scenarios 1–3 back-to-back). Individual scenarios are: 1 = two teams / one agent per team, 2 = two teams / two agents each, 3 = same as 1 with noisy policies.
+- `python demo.py --episodes 5000 --mode full` – console “story mode” that (re)trains if checkpoints are missing, shows the visual step-through, and finishes with the recognition summary. Use `--mode visualize` or `--mode recognize` to run a single phase.
+- `python incremental_recognition.py` – interactive CLI that replays a scenario step-by-step, printing obstacles, spawn presets, observations, and latency after each action.
+- `python visualizer_gui.py --episodes 5000` – launch the PyQt GUI with the obstacle-aware board, deterministic spawn preset, confidence bars, and latency panel. You can select a different preset or team sizing from the configuration dialog when prompted.
+
+Tip: to experiment with additional deterministic start states, either extend `envs.DEFAULT_INITIAL_POSITION_PRESETS` or instantiate `MultiAgentGridWorld(..., initial_agent_positions=[])` in your own driver script.
 
 ### Example Recognition Output
 

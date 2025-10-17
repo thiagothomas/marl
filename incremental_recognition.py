@@ -10,7 +10,8 @@ import os
 import sys
 import time
 import numpy as np
-from itertools import combinations
+from itertools import combinations, product
+from typing import Any, Dict, List, Tuple
 
 # Add parent directory to path
 
@@ -18,10 +19,9 @@ from envs.team_goal_environments import (
     TeamGoalTopRight,
     TeamGoalTopLeft,
     TeamGoalBottomLeft,
-    TeamGoalBottomRight,
-    TeamGoalCenter
+    TeamGoalBottomRight
 )
-from envs.multi_agent_grid_world import MultiAgentGridWorld
+from envs.multi_agent_grid_world import MultiAgentGridWorld, DEFAULT_INITIAL_POSITION_PRESETS
 from ml.ppo import PPOAgent
 from metrics.metrics import kl_divergence, softmin
 
@@ -37,37 +37,54 @@ class MultiAgentIncrementalVisualizer:
         self.team_sizes = team_sizes
         self.num_teams = len(team_sizes)
 
-    def compute_team_assignment_scores(self, observations_per_agent, possible_team_goals):
-        """Compute scores for all possible team assignments."""
-        agent_ids = [f'agent_{i}' for i in range(self.num_agents)]
-        agent_indices = list(range(self.num_agents))
+    def generate_goal_combinations(self) -> List[Tuple[str, ...]]:
+        """Generate all possible combinations of team goals."""
+        return list(product(self.goal_names, repeat=self.num_teams))
 
-        # Generate all possible team partitions
-        all_partitions = self._generate_team_partitions(agent_indices, self.team_sizes)
+    def _score_team_assignments(
+        self,
+        observations_per_agent,
+        possible_team_goals,
+        team_partitions
+    ):
+        """Internal helper mirroring the recognizer scoring logic."""
+        ranked = []
 
-        best_scores = []
-
-        for partition in all_partitions:
+        for partition in team_partitions:
             for goal_combination in possible_team_goals:
-                total_score = 0
+                if len(goal_combination) != len(partition):
+                    continue
+
+                total_score = 0.0
                 assignment = {}
-                score_details = []  # For debugging
+                score_details = []
+                valid_combo = True
 
                 for team_id, team_agents in enumerate(partition):
                     team_goal = goal_combination[team_id]
-                    goal_idx = self.goal_names.index(team_goal)
+                    try:
+                        goal_idx = self.goal_names.index(team_goal)
+                    except ValueError:
+                        valid_combo = False
+                        break
+
+                    policy_agent = self.agents[goal_idx]
 
                     for agent_idx in team_agents:
                         agent_id = f'agent_{agent_idx}'
-                        if agent_id in observations_per_agent and len(observations_per_agent[agent_id]) > 0:
-                            agent_obs = observations_per_agent[agent_id]
-                            score = -self.evaluation_function(agent_obs, self.agents[goal_idx])
+                        agent_obs = observations_per_agent.get(agent_id, [])
+
+                        if agent_obs:
+                            score = -self.evaluation_function(agent_obs, policy_agent)
                             total_score += score
                             score_details.append(f"{agent_id}→{team_goal}: {score:.2f}")
 
                         assignment[agent_id] = (team_id, team_goal)
 
-                best_scores.append({
+                if not valid_combo:
+                    continue
+
+                ranked.append({
                     'score': total_score,
                     'assignment': assignment,
                     'partition': partition,
@@ -75,10 +92,100 @@ class MultiAgentIncrementalVisualizer:
                     'score_details': score_details
                 })
 
-        # Sort by score
-        best_scores.sort(key=lambda x: x['score'], reverse=True)
+        ranked.sort(key=lambda x: x['score'], reverse=True)
+        return ranked
 
-        return best_scores
+    def compute_team_assignment_scores(self, observations_per_agent, possible_team_goals=None):
+        """Compute scores for all possible team assignments."""
+        agent_indices = list(range(self.num_agents))
+
+        # Generate all possible team partitions
+        all_partitions = self._generate_team_partitions(agent_indices, self.team_sizes)
+
+        if possible_team_goals is None:
+            possible_team_goals = self.generate_goal_combinations()
+
+        return self._score_team_assignments(
+            observations_per_agent,
+            possible_team_goals,
+            all_partitions
+        )
+
+    def compute_latency_metrics(
+        self,
+        observations_per_agent,
+        possible_team_goals,
+        true_assignment
+    ) -> Dict[str, Any]:
+        """Compute observation latency until correct predictions."""
+        if possible_team_goals is None:
+            possible_team_goals = self.generate_goal_combinations()
+
+        per_agent_counts = {aid: len(obs) for aid, obs in observations_per_agent.items()}
+        max_observations = max(per_agent_counts.values()) if per_agent_counts else 0
+        team_partitions = self._generate_team_partitions(list(range(self.num_agents)), self.team_sizes)
+
+        goal_latency = None
+        team_latency = None
+        joint_latency = None
+        step_history = []
+
+        if max_observations > 0:
+            for step in range(1, max_observations + 1):
+                truncated = {
+                    aid: (obs if len(obs) <= step else obs[:step])
+                    for aid, obs in observations_per_agent.items()
+                }
+                step_ranked = self._score_team_assignments(
+                    truncated,
+                    possible_team_goals,
+                    team_partitions
+                )
+
+                if not step_ranked:
+                    continue
+
+                best_assignment = step_ranked[0]['assignment']
+                goal_matches = team_matches = joint_matches = 0
+
+                if true_assignment:
+                    goal_matches = sum(
+                        1 for aid in true_assignment.keys()
+                        if best_assignment.get(aid, (None, None))[1] == true_assignment[aid][1]
+                    )
+                    team_matches = sum(
+                        1 for aid in true_assignment.keys()
+                        if best_assignment.get(aid, (None, None))[0] == true_assignment[aid][0]
+                    )
+                    joint_matches = sum(
+                        1 for aid in true_assignment.keys()
+                        if best_assignment.get(aid) == true_assignment[aid]
+                    )
+
+                    if goal_latency is None and goal_matches == self.num_agents:
+                        goal_latency = step
+                    if team_latency is None and team_matches == self.num_agents:
+                        team_latency = step
+                    if joint_latency is None and joint_matches == self.num_agents:
+                        joint_latency = step
+
+                step_history.append({
+                    'step': step,
+                    'best_assignment': best_assignment,
+                    'best_score': step_ranked[0]['score'],
+                    'goal_matches': goal_matches,
+                    'team_matches': team_matches,
+                    'joint_matches': joint_matches
+                })
+
+        return {
+            'goal_latency': goal_latency,
+            'team_latency': team_latency,
+            'joint_latency': joint_latency,
+            'max_observations': max_observations,
+            'per_agent_counts': per_agent_counts,
+            'step_history': step_history
+        }
 
     def _generate_team_partitions(self, agents, team_sizes):
         """Generate all possible ways to partition agents into teams."""
@@ -194,7 +301,14 @@ class MultiAgentIncrementalVisualizer:
         print(f"  G{team_id} = Goal markers")
         print(f"  *  = Path taken")
 
-    def display_team_beliefs(self, best_assignments, true_assignment, top_k=5):
+    def display_team_beliefs(
+        self,
+        best_assignments,
+        true_assignment,
+        observations_per_agent,
+        possible_team_goals,
+        top_k=5
+    ):
         """Display top team assignment hypotheses."""
         print(f"\n{'='*60}")
         print("TOP TEAM ASSIGNMENT HYPOTHESES")
@@ -258,6 +372,25 @@ class MultiAgentIncrementalVisualizer:
             for agent_id, (team_id, goal) in true_assignment.items():
                 print(f"  {agent_id}: Team {team_id} → {goal}")
 
+        latency = self.compute_latency_metrics(
+            observations_per_agent,
+            possible_team_goals,
+            true_assignment
+        )
+        max_obs = latency.get('max_observations', 0)
+        if max_obs:
+            goal_latency = latency.get('goal_latency')
+            team_latency = latency.get('team_latency')
+            joint_latency = latency.get('joint_latency')
+
+            def fmt(value):
+                return f"{value}/{max_obs}" if value is not None else f"not reached ≤ {max_obs}"
+
+            print("\nLatency Summary:")
+            print(f"  Goal lock-in: {fmt(goal_latency)}")
+            print(f"  Team lock-in: {fmt(team_latency)}")
+            print(f"  Joint lock-in: {fmt(joint_latency)}")
+
     def display_agent_observations(self, observations_per_agent, step_num):
         """Display observation counts for each agent."""
         print(f"\n{'='*60}")
@@ -269,8 +402,15 @@ class MultiAgentIncrementalVisualizer:
             print(f"  {agent_id}: {obs_count} observations")
 
 
-def create_expert_policies(team_goals, grid_size=7):
-    """Create expert policies for each team."""
+def create_expert_policies(team_goals, agents, goal_names, grid_size=7):
+    """Create expert policies using trained PPO models.
+
+    Args:
+        team_goals: List of team goal types (e.g., ['top_right', 'top_left'])
+        agents: List of trained PPO agents
+        goal_names: List of goal names corresponding to agents
+        grid_size: Size of the grid
+    """
     goal_positions = {}
 
     for goal_type in team_goals:
@@ -282,11 +422,52 @@ def create_expert_policies(team_goals, grid_size=7):
             goal_positions[goal_type] = np.array([0, grid_size - 1])
         elif goal_type == 'bottom_right':
             goal_positions[goal_type] = np.array([grid_size - 1, grid_size - 1])
-        elif goal_type == 'center':
-            goal_positions[goal_type] = np.array([grid_size // 2, grid_size // 2])
+        else:
+            raise ValueError(f"Unsupported goal type: {goal_type}")
 
     def expert_policy(obs, goal_type, agent_idx):
-        """Simple expert policy that moves towards goal.
+        """Use trained PPO policy for the given goal.
+
+        Args:
+            obs: Flat observation array [agent0_x, agent0_y, agent1_x, agent1_y, ...]
+            goal_type: Target goal type
+            agent_idx: Index of the agent (to extract correct position from obs)
+        """
+        # Map goal_type to goal_name used in training
+        goal_name_map = {
+            'top_right': 'team_goal_top_right',
+            'top_left': 'team_goal_top_left',
+            'bottom_left': 'team_goal_bottom_left',
+            'bottom_right': 'team_goal_bottom_right'
+        }
+
+        goal_name = goal_name_map.get(goal_type)
+        if not goal_name:
+            # Fallback to simple policy if goal not recognized
+            return simple_policy(obs, goal_type, agent_idx)
+
+        # Find the corresponding agent/model for this goal
+        try:
+            goal_idx = goal_names.index(goal_name)
+            agent = agents[goal_idx]
+
+            # Extract this agent's position from the full observation
+            pos_offset = agent_idx * 2
+            agent_pos = obs[pos_offset:pos_offset+2]
+
+            # Get action probabilities from the trained model
+            action_probs = agent.get_action_probabilities(agent_pos)
+
+            # Use deterministic action (argmax) for consistency
+            action = int(np.argmax(action_probs))
+
+            return action
+        except (ValueError, IndexError, AttributeError):
+            # If there's any error, fall back to simple policy
+            return simple_policy(obs, goal_type, agent_idx)
+
+    def simple_policy(obs, goal_type, agent_idx):
+        """Simple fallback policy that moves towards goal (doesn't handle obstacles well).
 
         Args:
             obs: Flat observation array [agent0_x, agent0_y, agent1_x, agent1_y, ...]
@@ -322,8 +503,7 @@ def main():
         "team_goal_top_right",
         "team_goal_top_left",
         "team_goal_bottom_left",
-        "team_goal_bottom_right",
-        "team_goal_center"
+        "team_goal_bottom_right"
     ]
 
     models_exist = all(
@@ -344,8 +524,7 @@ def main():
         TeamGoalTopRight,
         TeamGoalTopLeft,
         TeamGoalBottomLeft,
-        TeamGoalBottomRight,
-        TeamGoalCenter
+        TeamGoalBottomRight
     ]
 
     agents = []
@@ -408,8 +587,8 @@ def main():
             agents, goal_names, kl_divergence, num_agents, team_sizes
         )
 
-        # Create expert policies
-        expert_policy_fn = create_expert_policies(team_goals)
+        # Create expert policies using trained models
+        expert_policy_fn = create_expert_policies(team_goals, agents, goal_names)
 
         # Generate trajectory
         print(f"\n{'='*80}")
@@ -421,6 +600,20 @@ def main():
         print(f"Total agents: {num_agents}")
 
         obs_dict, info = env.reset()
+        initial_positions = info.get('initial_positions') or []
+        if initial_positions:
+            print("\nInitial agent positions (fixed):")
+            for idx, pos in enumerate(initial_positions):
+                print(f"  agent_{idx}: {tuple(pos)}")
+        else:
+            print("\nInitial agent positions: randomised (no preset available)")
+
+        preset_pool = DEFAULT_INITIAL_POSITION_PRESETS.get(tuple(team_sizes), [])
+        if preset_pool:
+            if initial_positions:
+                print(f"Preset {env.start_preset + 1}/{len(preset_pool)} selected.")
+            else:
+                print("Preset library available but not applied (random start).")
 
         # Define true assignment
         true_assignment = {}
@@ -459,15 +652,7 @@ def main():
             current_positions[agent_id] = obs_dict[agent_id][pos_offset:pos_offset+2].copy()
 
         # Possible goal combinations
-        possible_team_goals = [
-            tuple(f"team_goal_{g}" for g in combo)
-            for combo in [
-                ('top_right', 'top_left'),
-                ('top_left', 'top_right'),
-                ('bottom_left', 'bottom_right'),
-                ('top_right', 'bottom_left'),
-            ]
-        ]
+        possible_team_goals = visualizer.generate_goal_combinations()
 
         for step in range(MAX_STEPS):
             if mode != 1:
@@ -488,7 +673,13 @@ def main():
                 best_assignments = visualizer.compute_team_assignment_scores(
                     observations_per_agent, possible_team_goals
                 )
-                visualizer.display_team_beliefs(best_assignments, true_assignment, top_k=3)
+                visualizer.display_team_beliefs(
+                    best_assignments,
+                    true_assignment,
+                    observations_per_agent,
+                    possible_team_goals,
+                    top_k=3
+                )
             else:
                 print(f"\n{'='*60}")
                 print("No observations yet - waiting for agent actions...")

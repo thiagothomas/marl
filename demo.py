@@ -16,13 +16,12 @@ import sys
 
 # Add parent directory to path to access shared modules
 
-from envs.multi_agent_grid_world import MultiAgentGridWorld
+from envs.multi_agent_grid_world import MultiAgentGridWorld, DEFAULT_INITIAL_POSITION_PRESETS
 from envs.team_goal_environments import (
     TeamGoalTopRight,
     TeamGoalTopLeft,
     TeamGoalBottomLeft,
-    TeamGoalBottomRight,
-    TeamGoalCenter
+    TeamGoalBottomRight
 )
 from ml.ppo import PPOAgent
 from recognizer.multi_agent_recognizer import MultiAgentRecognizer
@@ -35,7 +34,30 @@ def visualize_scenario(env, policies, steps=20):
     print("VISUALIZATION")
     print("="*60)
 
-    obs_dict, _ = env.reset()
+    obs_dict, info = env.reset()
+    initial_positions = info.get('initial_positions') or []
+    if initial_positions:
+        print("\nInitial agent positions (fixed):")
+        for idx, pos in enumerate(initial_positions):
+            print(f"  agent_{idx}: {tuple(pos)}")
+    else:
+        print("\nInitial agent positions: randomised (no preset available)")
+
+    preset_pool = DEFAULT_INITIAL_POSITION_PRESETS.get(tuple(env.team_sizes), [])
+    if preset_pool:
+        if initial_positions:
+            print(f"Preset {env.start_preset + 1}/{len(preset_pool)} selected.")
+        else:
+            print("Preset library available but not applied (random start).")
+
+    if hasattr(env, "team_sizes"):
+        preset_pool = DEFAULT_INITIAL_POSITION_PRESETS.get(tuple(env.team_sizes), [])
+        if preset_pool:
+            if initial_positions:
+                print(f"Preset {env.start_preset + 1}/{len(preset_pool)} selected.")
+            else:
+                print("Preset library available but not applied (random start).")
+
     env.render()
 
     for step in range(steps):
@@ -186,16 +208,14 @@ def run_recognition_demo(episodes=1000):
             TeamGoalTopRight,
             TeamGoalTopLeft,
             TeamGoalBottomLeft,
-            TeamGoalBottomRight,
-            TeamGoalCenter
+            TeamGoalBottomRight
         ]
 
         goal_names = [
             "team_goal_top_right",
             "team_goal_top_left",
             "team_goal_bottom_left",
-            "team_goal_bottom_right",
-            "team_goal_center"
+            "team_goal_bottom_right"
         ]
 
         recognizer = MultiAgentRecognizer(
@@ -223,16 +243,14 @@ def run_recognition_demo(episodes=1000):
         TeamGoalTopRight,
         TeamGoalTopLeft,
         TeamGoalBottomLeft,
-        TeamGoalBottomRight,
-        TeamGoalCenter
+        TeamGoalBottomRight
     ]
 
     goal_names = [
         "team_goal_top_right",
         "team_goal_top_left",
         "team_goal_bottom_left",
-        "team_goal_bottom_right",
-        "team_goal_center"
+        "team_goal_bottom_right"
     ]
 
     recognizer = MultiAgentRecognizer(
@@ -278,10 +296,23 @@ def run_recognition_demo(episodes=1000):
         'agent_1': policy_tl   # Going top-left
     }
 
+    # Preview deterministic initial positions
+    initial_obs, init_info = env.reset()
+    initial_positions = init_info.get('initial_positions') or []
+    if initial_positions:
+        print("\nInitial agent positions (fixed):")
+        for idx, pos in enumerate(initial_positions):
+            print(f"  agent_{idx}: {tuple(pos)}")
+    else:
+        print("\nInitial agent positions: randomised (no preset available)")
+
     # Collect observations
     print("Collecting observations from unknown agents...")
     observations = recognizer.collect_multi_agent_observations(
-        env, num_steps=30, policies=test_policies
+        env,
+        num_steps=30,
+        policies=test_policies,
+        initial_obs=initial_obs
     )
 
     # Define possible team-goal combinations
@@ -290,7 +321,6 @@ def run_recognition_demo(episodes=1000):
         ('team_goal_top_left', 'team_goal_top_right'),
         ('team_goal_bottom_right', 'team_goal_top_left'),
         ('team_goal_bottom_left', 'team_goal_bottom_right'),
-        ('team_goal_center', 'team_goal_center'),
     ]
 
     # Perform recognition
@@ -303,6 +333,20 @@ def run_recognition_demo(episodes=1000):
     result = recognizer.recognize_with_team_assignment(
         observations, possible_goals, true_assignment
     )
+
+    latency = result.get('latency')
+    if latency and latency.get('max_observations'):
+        max_obs = latency['max_observations']
+        goal_str = f"{latency.get('goal_latency')}/{max_obs}" if latency.get('goal_latency') is not None else f"not reached ≤ {max_obs}"
+        team_str = f"{latency.get('team_latency')}/{max_obs}" if latency.get('team_latency') is not None else f"not reached ≤ {max_obs}"
+        joint_str = f"{latency.get('joint_latency')}/{max_obs}" if latency.get('joint_latency') is not None else f"not reached ≤ {max_obs}"
+        print("\nObservation Efficiency:")
+        print("  Observations per agent:")
+        for agent_id in sorted(latency.get('per_agent_counts', {}).keys()):
+            print(f"    {agent_id}: {latency['per_agent_counts'][agent_id]}")
+        print(f"  Goal lock-in: {goal_str}")
+        print(f"  Team lock-in: {team_str}")
+        print(f"  Joint lock-in: {joint_str}")
 
     print("\n" + "="*70)
     print("DEMO COMPLETE")

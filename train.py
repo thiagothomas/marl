@@ -13,8 +13,7 @@ from envs.team_goal_environments import (
     TeamGoalTopRight,
     TeamGoalTopLeft,
     TeamGoalBottomLeft,
-    TeamGoalBottomRight,
-    TeamGoalCenter
+    TeamGoalBottomRight
 )
 from ml.ppo import PPOAgent
 from recognizer.multi_agent_recognizer import MultiAgentRecognizer
@@ -46,16 +45,14 @@ def main():
         TeamGoalTopRight,    # Team goal: reach top-right
         TeamGoalTopLeft,     # Team goal: reach top-left
         TeamGoalBottomLeft,  # Team goal: reach bottom-left
-        TeamGoalBottomRight, # Team goal: reach bottom-right
-        TeamGoalCenter       # Team goal: reach/stay at center
+        TeamGoalBottomRight  # Team goal: reach bottom-right
     ]
 
     goal_names = [
         "team_goal_top_right",
         "team_goal_top_left",
         "team_goal_bottom_left",
-        "team_goal_bottom_right",
-        "team_goal_center"
+        "team_goal_bottom_right"
     ]
 
     print(f"\nTeam Goals to Train:")

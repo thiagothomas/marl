@@ -10,7 +10,7 @@ import sys
 import os
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from itertools import combinations
+from itertools import combinations, product
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,7 +23,7 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPalette
 
 from envs.team_goal_environments import (
     TeamGoalTopRight, TeamGoalTopLeft, TeamGoalBottomLeft,
-    TeamGoalBottomRight, TeamGoalCenter
+    TeamGoalBottomRight
 )
 from envs.multi_agent_grid_world import MultiAgentGridWorld
 from ml.ppo import PPOAgent
@@ -43,6 +43,7 @@ class GridCanvas(QWidget):
         self.team_goals = []
         self.agent_teams = []
         self.goals_reached = {}  # Track which agents reached goals
+        self.obstacles = []
         self.setMinimumSize(self.grid_size * self.cell_size + 50,
                            self.grid_size * self.cell_size + 50)
 
@@ -58,10 +59,11 @@ class GridCanvas(QWidget):
                 QColor(162, 155, 254),  # Purple
             ],
             'goal': QColor(255, 215, 0, 100),  # Gold
+            'obstacle': QColor(120, 130, 150)  # Neutral slate
         }
 
     def update_state(self, agent_positions, trajectories, goal_positions,
-                    team_goals, agent_teams, goals_reached=None):
+                    team_goals, agent_teams, goals_reached=None, obstacles=None):
         """Update the grid state."""
         self.agent_positions = agent_positions
         self.trajectories = trajectories
@@ -69,6 +71,7 @@ class GridCanvas(QWidget):
         self.team_goals = team_goals
         self.agent_teams = agent_teams
         self.goals_reached = goals_reached if goals_reached is not None else {}
+        self.obstacles = obstacles if obstacles is not None else []
         self.update()
 
     def paintEvent(self, event):
@@ -83,6 +86,18 @@ class GridCanvas(QWidget):
                         self.grid_size * self.cell_size,
                         self.grid_size * self.cell_size,
                         self.colors['grid'])
+
+        # Draw obstacles before grid lines to appear under outlines
+        if self.obstacles:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(self.colors['obstacle']))
+            for ox, oy in self.obstacles:
+                painter.drawRect(
+                    offset_x + ox * self.cell_size,
+                    offset_y + oy * self.cell_size,
+                    self.cell_size,
+                    self.cell_size
+                )
 
         # Draw grid lines
         painter.setPen(QPen(self.colors['grid_line'], 1))
@@ -536,6 +551,28 @@ class MetricsPanel(QWidget):
         acc_group.setLayout(acc_layout)
         layout.addWidget(acc_group)
 
+        # Latency metrics
+        latency_group = QGroupBox("Recognition Latency")
+        latency_group.setStyleSheet(predictions_group.styleSheet())
+        latency_layout = QVBoxLayout()
+
+        self.goal_latency_label = QLabel("Goal lock-in: --")
+        self.team_latency_label = QLabel("Team lock-in: --")
+        self.joint_latency_label = QLabel("Joint lock-in: --")
+
+        for label in [self.goal_latency_label, self.team_latency_label, self.joint_latency_label]:
+            label.setStyleSheet("""
+                QLabel {
+                    font-size: 12px;
+                    padding: 5px;
+                    color: #2c3e50;
+                }
+            """)
+            latency_layout.addWidget(label)
+
+        latency_group.setLayout(latency_layout)
+        layout.addWidget(latency_group)
+
         layout.addStretch()
         self.setLayout(layout)
 
@@ -636,6 +673,23 @@ class MetricsPanel(QWidget):
         self.team_accuracy_label.setText(
             f"Team Accuracy: {team_acc:.1%} ({correct_teams}/{num_agents})"
         )
+
+    def update_latency(self, latency_info):
+        """Update latency labels."""
+        if not latency_info or not latency_info.get('max_observations'):
+            self.goal_latency_label.setText("Goal lock-in: --")
+            self.team_latency_label.setText("Team lock-in: --")
+            self.joint_latency_label.setText("Joint lock-in: --")
+            return
+
+        max_obs = latency_info['max_observations']
+
+        def fmt(value):
+            return f"{value}/{max_obs}" if value is not None else f"not reached ≤ {max_obs}"
+
+        self.goal_latency_label.setText(f"Goal lock-in: {fmt(latency_info.get('goal_latency'))}")
+        self.team_latency_label.setText(f"Team lock-in: {fmt(latency_info.get('team_latency'))}")
+        self.joint_latency_label.setText(f"Joint lock-in: {fmt(latency_info.get('joint_latency'))}")
 
 
 class VisualizerMainWindow(QMainWindow):
@@ -885,6 +939,8 @@ class VisualizerMainWindow(QMainWindow):
         self.trajectories = {f'agent_{i}': [] for i in range(self.num_agents)}
         self.goals_reached = {f'agent_{i}': False for i in range(self.num_agents)}
 
+        self.true_assignment = {}
+
         # Define true assignment
         agent_counter = 0
         for team_id, team_size in enumerate(self.team_sizes):
@@ -895,6 +951,7 @@ class VisualizerMainWindow(QMainWindow):
 
         # Reset environment
         self.obs_dict, info = self.env.reset()
+        self.initial_positions = info.get('initial_positions')
 
         # Extract initial positions
         self.current_positions = {}
@@ -902,6 +959,15 @@ class VisualizerMainWindow(QMainWindow):
             agent_id = f'agent_{i}'
             pos_offset = i * 2
             self.current_positions[agent_id] = self.obs_dict[agent_id][pos_offset:pos_offset+2].copy()
+
+        if hasattr(self, "status_label"):
+            if self.initial_positions:
+                pos_summary = ", ".join(
+                    f"agent_{idx}:{tuple(pos)}" for idx, pos in enumerate(self.initial_positions)
+                )
+                self.status_label.setText(f"Ready to start | initial positions: {pos_summary}")
+            else:
+                self.status_label.setText("Ready to start")
 
         # Update display
         self.update_display()
@@ -1020,7 +1086,13 @@ class VisualizerMainWindow(QMainWindow):
         self.step_btn.setEnabled(True)
         self.start_btn.setEnabled(True)
         self.init_environment()
-        self.status_label.setText("Reset - Ready to start")
+        if self.initial_positions:
+            pos_summary = ", ".join(
+                f"agent_{idx}:{tuple(pos)}" for idx, pos in enumerate(self.initial_positions)
+            )
+            self.status_label.setText(f"Reset - Ready | initial positions: {pos_summary}")
+        else:
+            self.status_label.setText("Reset - Ready to start")
 
     def update_display(self):
         """Update all display elements."""
@@ -1031,7 +1103,8 @@ class VisualizerMainWindow(QMainWindow):
             self.env.goal_positions,
             self.env.team_goals,
             self.env.agent_teams,
-            self.goals_reached
+            self.goals_reached,
+            obstacles=self.env.obstacles
         )
 
         # Update observations
@@ -1054,6 +1127,10 @@ class VisualizerMainWindow(QMainWindow):
                     self.true_assignment,
                     self.num_agents
                 )
+                latency_info = self.compute_latency_metrics()
+                self.metrics_panel.update_latency(latency_info)
+        else:
+            self.metrics_panel.update_latency({})
 
     def compute_per_agent_goal_scores(self):
         """Compute KL divergence scores for each agent against each goal policy.
@@ -1081,47 +1158,49 @@ class VisualizerMainWindow(QMainWindow):
 
         return agent_scores
 
-    def compute_team_assignment_scores(self):
-        """Compute scores for all possible team assignments."""
-        agent_indices = list(range(self.num_agents))
-        all_partitions = self._generate_team_partitions(agent_indices, self.team_sizes)
+    def _generate_goal_combinations(self):
+        """Generate all possible goal combinations for the configured teams."""
+        return list(product(self.goal_names, repeat=self.num_teams))
 
-        # Possible goal combinations
-        possible_team_goals = [
-            tuple(f"team_goal_{g}" for g in combo)
-            for combo in [
-                ('top_right', 'top_left'),
-                ('top_left', 'top_right'),
-                ('bottom_left', 'bottom_right'),
-                ('top_right', 'bottom_left'),
-            ]
-        ]
+    def _score_team_assignments(self, observations_per_agent, possible_team_goals, team_partitions):
+        ranked = []
 
-        best_scores = []
-
-        for partition in all_partitions:
+        for partition in team_partitions:
             for goal_combination in possible_team_goals:
-                total_score = 0
+                if len(goal_combination) != len(partition):
+                    continue
+
+                total_score = 0.0
                 assignment = {}
                 score_details = []
+                valid_combo = True
 
                 for team_id, team_agents in enumerate(partition):
                     team_goal = goal_combination[team_id]
-                    goal_idx = self.goal_names.index(team_goal)
+                    try:
+                        goal_idx = self.goal_names.index(team_goal)
+                    except ValueError:
+                        valid_combo = False
+                        break
+
+                    agent_policy = self.agents[goal_idx]
 
                     for agent_idx in team_agents:
                         agent_id = f'agent_{agent_idx}'
-                        if agent_id in self.observations_per_agent and len(self.observations_per_agent[agent_id]) > 0:
-                            agent_obs = self.observations_per_agent[agent_id]
+                        agent_obs = observations_per_agent.get(agent_id, [])
 
-                            kl_div = kl_divergence(agent_obs, self.agents[goal_idx])
+                        if agent_obs:
+                            kl_div = kl_divergence(agent_obs, agent_policy)
                             score = -kl_div
                             total_score += score
                             score_details.append(f"{agent_id}→{team_goal}: {score:.4f}")
 
                         assignment[agent_id] = (team_id, team_goal)
 
-                best_scores.append({
+                if not valid_combo:
+                    continue
+
+                ranked.append({
                     'score': total_score,
                     'assignment': assignment,
                     'partition': partition,
@@ -1129,8 +1208,100 @@ class VisualizerMainWindow(QMainWindow):
                     'score_details': score_details
                 })
 
-        best_scores.sort(key=lambda x: x['score'], reverse=True)
-        return best_scores
+        ranked.sort(key=lambda x: x['score'], reverse=True)
+        return ranked
+
+    def compute_team_assignment_scores(self, possible_team_goals=None):
+        """Compute scores for all possible team assignments."""
+        agent_indices = list(range(self.num_agents))
+        all_partitions = self._generate_team_partitions(agent_indices, self.team_sizes)
+
+        if possible_team_goals is None:
+            possible_team_goals = self._generate_goal_combinations()
+
+        return self._score_team_assignments(
+            self.observations_per_agent,
+            possible_team_goals,
+            all_partitions
+        )
+
+    def compute_latency_metrics(self, possible_team_goals=None):
+        """Compute latency information for recognition."""
+        if possible_team_goals is None:
+            possible_team_goals = self._generate_goal_combinations()
+
+        per_agent_counts = {aid: len(obs) for aid, obs in self.observations_per_agent.items()}
+        max_observations = max(per_agent_counts.values()) if per_agent_counts else 0
+        team_partitions = self._generate_team_partitions(list(range(self.num_agents)), self.team_sizes)
+
+        if not self.true_assignment:
+            return {
+                'goal_latency': None,
+                'team_latency': None,
+                'joint_latency': None,
+                'max_observations': max_observations,
+                'per_agent_counts': per_agent_counts
+            }
+
+        goal_latency = None
+        team_latency = None
+        joint_latency = None
+
+        if max_observations == 0:
+            return {
+                'goal_latency': None,
+                'team_latency': None,
+                'joint_latency': None,
+                'max_observations': 0,
+                'per_agent_counts': per_agent_counts
+            }
+
+        for step in range(1, max_observations + 1):
+            truncated = {
+                aid: (obs if len(obs) <= step else obs[:step])
+                for aid, obs in self.observations_per_agent.items()
+            }
+
+            step_ranked = self._score_team_assignments(
+                truncated,
+                possible_team_goals,
+                team_partitions
+            )
+            if not step_ranked:
+                continue
+
+            step_best = step_ranked[0]['assignment']
+
+            goal_matches = sum(
+                1 for aid in self.true_assignment.keys()
+                if step_best.get(aid, (None, None))[1] == self.true_assignment[aid][1]
+            )
+            team_matches = sum(
+                1 for aid in self.true_assignment.keys()
+                if step_best.get(aid, (None, None))[0] == self.true_assignment[aid][0]
+            )
+            joint_matches = sum(
+                1 for aid in self.true_assignment.keys()
+                if step_best.get(aid) == self.true_assignment[aid]
+            )
+
+            if goal_latency is None and goal_matches == self.num_agents:
+                goal_latency = step
+            if team_latency is None and team_matches == self.num_agents:
+                team_latency = step
+            if joint_latency is None and joint_matches == self.num_agents:
+                joint_latency = step
+
+            if goal_latency and team_latency and joint_latency:
+                break
+
+        return {
+            'goal_latency': goal_latency,
+            'team_latency': team_latency,
+            'joint_latency': joint_latency,
+            'max_observations': max_observations,
+            'per_agent_counts': per_agent_counts
+        }
 
     def _generate_team_partitions(self, agents, team_sizes):
         """Generate all possible ways to partition agents into teams."""
@@ -1154,13 +1325,49 @@ class VisualizerMainWindow(QMainWindow):
         return partitions
 
     def expert_policy(self, obs, goal_type, agent_idx):
-        """Simple expert policy that moves towards goal."""
+        """Use trained PPO policy for the given goal."""
+        # Map goal_type to goal_name used in training
+        goal_name_map = {
+            'top_right': 'team_goal_top_right',
+            'top_left': 'team_goal_top_left',
+            'bottom_left': 'team_goal_bottom_left',
+            'bottom_right': 'team_goal_bottom_right'
+        }
+
+        goal_name = goal_name_map.get(goal_type)
+        if not goal_name:
+            # Fallback to simple policy if goal not recognized
+            return self.simple_policy(obs, goal_type, agent_idx)
+
+        # Find the corresponding agent/model for this goal
+        try:
+            goal_idx = self.goal_names.index(goal_name)
+            agent = self.agents[goal_idx]
+
+            # Extract this agent's position from the full observation
+            pos_offset = agent_idx * 2
+            agent_pos = obs[pos_offset:pos_offset+2]
+
+            # Get action probabilities from the trained model
+            action_probs = agent.get_action_probabilities(agent_pos)
+
+            # Sample action from the distribution (or take argmax for deterministic)
+            # For visualization, we'll use deterministic (argmax) for consistency
+            action = int(np.argmax(action_probs))
+
+            return action
+        except (ValueError, IndexError, AttributeError) as e:
+            # If there's any error, fall back to simple policy
+            print(f"Warning: Failed to use trained policy for {goal_type}, using simple policy. Error: {e}")
+            return self.simple_policy(obs, goal_type, agent_idx)
+
+    def simple_policy(self, obs, goal_type, agent_idx):
+        """Simple fallback policy that moves towards goal (doesn't handle obstacles well)."""
         goal_positions = {
             'top_right': np.array([6, 0]),
             'top_left': np.array([0, 0]),
             'bottom_left': np.array([0, 6]),
-            'bottom_right': np.array([6, 6]),
-            'center': np.array([3, 3])
+            'bottom_right': np.array([6, 6])
         }
 
         goal_pos = goal_positions[goal_type]
@@ -1375,8 +1582,7 @@ def main():
         "team_goal_top_right",
         "team_goal_top_left",
         "team_goal_bottom_left",
-        "team_goal_bottom_right",
-        "team_goal_center"
+        "team_goal_bottom_right"
     ]
 
     # Verify models exist for selected episodes
@@ -1398,8 +1604,7 @@ def main():
         TeamGoalTopRight,
         TeamGoalTopLeft,
         TeamGoalBottomLeft,
-        TeamGoalBottomRight,
-        TeamGoalCenter
+        TeamGoalBottomRight
     ]
 
     agents = []

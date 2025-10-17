@@ -3,7 +3,7 @@
 import os
 import numpy as np
 from typing import List, Tuple, Optional, Callable, Type, Dict, Any
-from itertools import product, permutations
+from itertools import permutations
 from ml.base_agent import RLAgent
 from ml.ppo import PPOAgent
 from metrics.metrics import softmin
@@ -68,7 +68,8 @@ class MultiAgentRecognizer(Recognizer):
         self,
         env: gym.Env,
         num_steps: int = 50,
-        policies: Optional[Dict[str, Callable]] = None
+        policies: Optional[Dict[str, Callable]] = None,
+        initial_obs: Optional[Dict[str, np.ndarray]] = None
     ) -> Dict[str, List[Tuple[np.ndarray, int]]]:
         """Collect observations from multiple agents acting in the environment.
 
@@ -76,6 +77,7 @@ class MultiAgentRecognizer(Recognizer):
             env: Multi-agent environment
             num_steps: Number of steps to collect
             policies: Optional dict of policies per agent (if None, uses random)
+            initial_obs: Optional observation dict to start from (skips env.reset())
 
         Returns:
             Dict mapping agent_id to list of (observation, action) tuples
@@ -84,7 +86,13 @@ class MultiAgentRecognizer(Recognizer):
             f'agent_{i}': [] for i in range(self.num_agents)
         }
 
-        obs_dict, _ = env.reset()
+        if initial_obs is None:
+            obs_dict, _ = env.reset()
+        else:
+            obs_dict = {
+                agent_id: np.array(obs, copy=True)
+                for agent_id, obs in initial_obs.items()
+            }
 
         for step in range(num_steps):
             actions = {}
@@ -180,6 +188,60 @@ class MultiAgentRecognizer(Recognizer):
             'method': 'independent'
         }
 
+    def _score_team_assignments(
+        self,
+        observations_per_agent: Dict[str, List[Tuple[np.ndarray, int]]],
+        possible_team_goals: List[Tuple[str, ...]],
+        team_partitions: List[List[List[int]]]
+    ) -> List[Dict[str, Any]]:
+        """Score all team-goal assignment combinations."""
+        ranked = []
+
+        for partition in team_partitions:
+            for goal_combination in possible_team_goals:
+                if len(goal_combination) != len(partition):
+                    continue
+
+                total_score = 0.0
+                assignment = {}
+                score_details = []
+                valid_combo = True
+
+                for team_id, team_agents in enumerate(partition):
+                    team_goal = goal_combination[team_id]
+                    try:
+                        goal_idx = self.goal_names.index(team_goal)
+                    except ValueError:
+                        valid_combo = False
+                        break
+
+                    policy_agent = self.agents[goal_idx]
+
+                    for agent_idx in team_agents:
+                        agent_id = f'agent_{agent_idx}'
+                        agent_obs = observations_per_agent.get(agent_id, [])
+
+                        if agent_obs:
+                            score = -self.evaluation_function(agent_obs, policy_agent)
+                            total_score += score
+                            score_details.append(f"{agent_id}→{team_goal}: {score:.4f}")
+
+                        assignment[agent_id] = (team_id, team_goal)
+
+                if not valid_combo:
+                    continue
+
+                ranked.append({
+                    'score': total_score,
+                    'assignment': assignment,
+                    'partition': partition,
+                    'goals': goal_combination,
+                    'score_details': score_details
+                })
+
+        ranked.sort(key=lambda item: item['score'], reverse=True)
+        return ranked
+
     def recognize_with_team_assignment(
         self,
         observations_per_agent: Dict[str, List[Tuple[np.ndarray, int]]],
@@ -204,9 +266,14 @@ class MultiAgentRecognizer(Recognizer):
         print("JOINT TEAM-GOAL RECOGNITION (BRUTE FORCE)")
         print("="*60)
 
-        agent_ids = list(observations_per_agent.keys())
-        best_score = float('-inf')
-        best_assignment = None
+        def truncate_observations(step: int) -> Dict[str, List[Tuple[np.ndarray, int]]]:
+            truncated: Dict[str, List[Tuple[np.ndarray, int]]] = {}
+            for agent_id, obs_list in observations_per_agent.items():
+                if len(obs_list) <= step:
+                    truncated[agent_id] = obs_list.copy()
+                else:
+                    truncated[agent_id] = obs_list[:step]
+            return truncated
 
         # Generate all possible ways to assign agents to teams
         # This is a partition problem: divide N agents into teams of specific sizes
@@ -219,30 +286,17 @@ class MultiAgentRecognizer(Recognizer):
         print(f"with {len(possible_team_goals)} goal combinations each")
         print(f"Total combinations: {len(all_team_assignments) * len(possible_team_goals)}")
 
-        # Try all combinations of team assignments and goal assignments
-        for team_partition in all_team_assignments:
-            for goal_combination in possible_team_goals:
-                total_score = 0
+        ranked_assignments = self._score_team_assignments(
+            observations_per_agent,
+            possible_team_goals,
+            all_team_assignments
+        )
 
-                # Build assignment dict
-                current_assignment = {}
-                for team_id, team_agents in enumerate(team_partition):
-                    team_goal = goal_combination[team_id]
-                    goal_idx = self.goal_names.index(team_goal)
+        if not ranked_assignments:
+            raise ValueError("No valid team-goal assignments produced a score. Check possible_team_goals.")
 
-                    for agent_idx in team_agents:
-                        agent_id = f'agent_{agent_idx}'
-                        agent_obs = observations_per_agent[agent_id]
-
-                        # Evaluate this agent against this goal
-                        score = -self.evaluation_function(agent_obs, self.agents[goal_idx])
-                        total_score += score
-
-                        current_assignment[agent_id] = (team_id, team_goal)
-
-                if total_score > best_score:
-                    best_score = total_score
-                    best_assignment = current_assignment
+        best_assignment = ranked_assignments[0]['assignment']
+        best_score = ranked_assignments[0]['score']
 
         # Display results
         print("\n" + "-"*60)
@@ -288,12 +342,96 @@ class MultiAgentRecognizer(Recognizer):
                 'correct_teams': correct_teams
             }
 
+        # Recognition latency (observations needed for correctness)
+        per_agent_counts = {aid: len(obs) for aid, obs in observations_per_agent.items()}
+        max_observations = max(per_agent_counts.values()) if per_agent_counts else 0
+        step_history: List[Dict[str, Any]] = []
+        goal_latency = None
+        team_latency = None
+        joint_latency = None
+
+        if max_observations > 0:
+            for step in range(1, max_observations + 1):
+                truncated_obs = truncate_observations(step)
+                step_rankings = self._score_team_assignments(
+                    truncated_obs,
+                    possible_team_goals,
+                    all_team_assignments
+                )
+
+                if not step_rankings:
+                    continue
+
+                step_best = step_rankings[0]['assignment']
+                goal_matches = team_matches = joint_matches = 0
+
+                if real_assignment:
+                    goal_matches = sum(
+                        1 for aid in real_assignment.keys()
+                        if step_best.get(aid, (None, None))[1] == real_assignment[aid][1]
+                    )
+                    team_matches = sum(
+                        1 for aid in real_assignment.keys()
+                        if step_best.get(aid, (None, None))[0] == real_assignment[aid][0]
+                    )
+                    joint_matches = sum(
+                        1 for aid in real_assignment.keys()
+                        if step_best.get(aid) == real_assignment[aid]
+                    )
+
+                    if goal_latency is None and goal_matches == self.num_agents:
+                        goal_latency = step
+                    if team_latency is None and team_matches == self.num_agents:
+                        team_latency = step
+                    if joint_latency is None and joint_matches == self.num_agents:
+                        joint_latency = step
+
+                step_history.append({
+                    'step': step,
+                    'best_assignment': step_best,
+                    'best_score': step_rankings[0]['score'],
+                    'goal_matches': goal_matches,
+                    'team_matches': team_matches,
+                    'joint_matches': joint_matches,
+                    'top_assignments': step_rankings[:3]
+                })
+
+        if real_assignment and max_observations > 0:
+            print("\nRecognition Latency:")
+            goal_msg = (
+                f"  Goals correct at observation {goal_latency}/{max_observations}"
+                if goal_latency is not None else
+                f"  Goals never fully correct within {max_observations} observations"
+            )
+            team_msg = (
+                f"  Teams correct at observation {team_latency}/{max_observations}"
+                if team_latency is not None else
+                f"  Teams never fully correct within {max_observations} observations"
+            )
+            joint_msg = (
+                f"  Joint assignment correct at observation {joint_latency}/{max_observations}"
+                if joint_latency is not None else
+                f"  Joint assignment never fully correct within {max_observations} observations"
+            )
+            print(goal_msg)
+            print(team_msg)
+            print(joint_msg)
+
         return {
             'best_assignment': best_assignment,
             'team_assignments': team_assignments,
             'best_score': best_score,
             'method': 'joint_brute_force',
-            'accuracy': accuracy_info
+            'accuracy': accuracy_info,
+            'ranked_assignments': ranked_assignments,
+            'latency': {
+                'goal_latency': goal_latency,
+                'team_latency': team_latency,
+                'joint_latency': joint_latency,
+                'max_observations': max_observations,
+                'per_agent_counts': per_agent_counts,
+                'step_history': step_history
+            }
         }
 
     def _generate_team_partitions(self, agents: List[int], team_sizes: List[int]) -> List[List[List[int]]]:
