@@ -120,6 +120,33 @@ Interactive visualizer that shows:
 - Top-k hypothesis rankings at each step
 - Final team assignment prediction
 
+### StarCraft Scenario Workflow
+
+- Maps live under `starcraft-maps/sc1-map/` and their associated start/goal
+  scenarios reside in `starcraft-maps/sc1-scen/`.
+- Train PPO policies for the first N scenarios using
+  ```bash
+  python train_starcraft.py --map-id Aftershock --episodes 5000 --scenario-count 10
+  ```
+  which writes one checkpoint per scenario inside
+  `models/starcraft/<map_id>/episodes_<episodes>/` and records the automatically
+  derived horizon/penalty/shape settings. Use `--scenario-index` /
+  `--scenario-id` to target specific lines, or `--max-steps-scale` to override
+  the auto scaling.
+  Use `--scenario-index` or `--scenario-id` to target a specific line.
+- Evaluate trained policies (for reuse in recognition) via
+  ```bash
+  python recognize_starcraft.py --map-id Aftershock --train-episodes 5000 --rollouts 10
+  ```
+  to report success rates and reward statistics. See
+  `docs/starcraft_workflow.md` for details on extending or filtering scenarios.
+- Visualize a trained scenario directly on the high-resolution PNG with
+  ```bash
+  python visualize_starcraft.py --map-id Aftershock --episodes 5000 --scenario-index 0
+  ```
+  and watch the greedy policy trace over `sc1-png/<map>.png`. Use `+` / `-`
+  (or the mouse wheel) to zoom, drag to pan, and press `0` to reset view.
+
 ## Multi-Agent Environment
 
 ### Grid World Setup

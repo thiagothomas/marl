@@ -61,6 +61,7 @@ class PPOAgent(RLAgent):
             gamma=gamma,
             **kwargs
         )
+        self.learning_rate = learning_rate
 
         self.clip_eps = clip_eps
         self.epochs = epochs
@@ -94,6 +95,10 @@ class PPOAgent(RLAgent):
 
         # Storage for rollouts
         self.reset_rollout_storage()
+        self._current_episode_return = 0.0
+        self._current_episode_length = 0
+        self.total_steps = 0
+        self.total_successes = 0
 
     def reset_rollout_storage(self):
         """Reset storage for rollout data."""
@@ -103,6 +108,9 @@ class PPOAgent(RLAgent):
         self.done_buffer = []
         self.value_buffer = []
         self.log_prob_buffer = []
+        self.rollout_episode_returns = []
+        self.rollout_episode_lengths = []
+        self.rollout_successes = 0
 
     def collect_rollout(self, num_steps: int) -> Tuple[List, List, List, List, List, List]:
         """Collect rollout data.
@@ -140,11 +148,23 @@ class PPOAgent(RLAgent):
             # Track state for coverage
             self.track_state(obs)
 
+            # Accumulate episode statistics
+            self._current_episode_return += reward
+            self._current_episode_length += 1
+            self.total_steps += 1
+
             # Update observation
             obs = next_obs
 
             # Reset if done
             if done:
+                if terminated:
+                    self.rollout_successes += 1
+                    self.total_successes += 1
+                self.rollout_episode_returns.append(self._current_episode_return)
+                self.rollout_episode_lengths.append(self._current_episode_length)
+                self._current_episode_return = 0.0
+                self._current_episode_length = 0
                 obs, _ = self.env.reset()
                 self.episodes_completed += 1
 
@@ -278,11 +298,20 @@ class PPOAgent(RLAgent):
     def learn(self):
         """Train the PPO agent."""
         print(f"Training PPO agent for goal: {self.goal_hypothesis}")
-        print(f"Episodes: {self.episodes}, Device: {self.device}")
+        max_steps = getattr(self.env, "max_steps", None)
+        runtime_info = f", Max Steps: {max_steps}" if max_steps is not None else ""
+        print(
+            f"Episodes: {self.episodes}, Device: {self.device}, Rollout: {self.rollout_length}, "
+            f"LR: {self.learning_rate}, Gamma: {self.gamma}, Clip: {self.clip_eps}{runtime_info}"
+        )
 
         # Initialize environment
         self.current_obs, _ = self.env.reset()
         self.episodes_completed = 0
+        self._current_episode_return = 0.0
+        self._current_episode_length = 0
+        self.total_steps = 0
+        self.total_successes = 0
 
         # Training loop
         num_updates = self.episodes // (self.rollout_length // 100)  # Approximate
@@ -309,8 +338,26 @@ class PPOAgent(RLAgent):
             # Print progress
             if update % 100 == 0:
                 mean_reward = np.mean(rewards)
-                print(f"Update {update}/{num_updates}, Episodes: {self.episodes_completed}, "
-                      f"Mean Reward: {mean_reward:.3f}, States Seen: {len(self.states_counter)}")
+                if self.rollout_episode_returns:
+                    mean_return = np.mean(self.rollout_episode_returns)
+                    mean_length = np.mean(self.rollout_episode_lengths)
+                    success_rate = self.rollout_successes / len(self.rollout_episode_returns)
+                else:
+                    mean_return = float(np.sum(rewards))
+                    mean_length = float(self._current_episode_length)
+                    success_rate = 0.0
+                max_steps = getattr(self.env, "max_steps", None)
+                max_steps_info = f", Max Steps: {max_steps}" if max_steps is not None else ""
+                print(
+                    f"Update {update}/{num_updates}, Episodes: {self.episodes_completed}, "
+                    f"Mean Reward: {mean_reward:.3f}, "
+                    f"Mean Return: {mean_return:.3f}, "
+                    f"Success Rate: {success_rate:.2%}, "
+                    f"Avg Len: {mean_length:.1f}, "
+                    f"Total Successes: {self.total_successes}, "
+                    f"Total Steps: {self.total_steps}"
+                    f"{max_steps_info}, States Seen: {len(self.states_counter)}"
+                )
 
             # Save model periodically
             if update % 1000 == 0:
