@@ -17,6 +17,9 @@ class RuntimeParameters:
     goal_reward: float
     scale_used: float
     progress_scale: float
+    allow_diagonal_actions: bool
+    view_mode: str
+    view_radius: int
 
 
 def derive_runtime_parameters(
@@ -27,6 +30,11 @@ def derive_runtime_parameters(
     bucket_weight: float = 0.5,
     base_goal_reward: float = 1.0,
     invalid_penalty_multiplier: float = 4.0,
+    allow_diagonal_actions: bool = False,
+    view_mode: str = "cardinal",
+    view_radius: int = 1,
+    fixed_step_penalty: Optional[float] = 0.01,
+    fixed_progress_scale: Optional[float] = 0.1,
 ) -> RuntimeParameters:
     """
     Produce environment runtime parameters based on scenario metadata.
@@ -47,13 +55,22 @@ def derive_runtime_parameters(
     )
 
     max_steps = max(int(math.ceil(scenario.optimal_length * scale)), 1)
-    step_penalty = 1.0 / max_steps
-    invalid_penalty = invalid_penalty_multiplier * step_penalty
+    normalized_view_mode = view_mode.strip().lower()
 
-    # Encourage forward progress with a shaping term proportional to expected episode length.
-    rough_episode_count = scenario.optimal_length or 1.0
-    progress_scale = 4.0 * step_penalty * rough_episode_count
-    progress_scale = float(max(0.05, min(1.0, progress_scale)))
+    if fixed_step_penalty is None:
+        step_penalty = 1.0 / max_steps
+        invalid_penalty = invalid_penalty_multiplier * step_penalty
+        rough_episode_count = scenario.optimal_length or 1.0
+        progress_scale = 4.0 * step_penalty * rough_episode_count
+        progress_scale = float(max(0.05, min(1.0, progress_scale)))
+    else:
+        step_penalty = float(fixed_step_penalty)
+        invalid_penalty = invalid_penalty_multiplier * step_penalty
+        progress_scale = (
+            float(fixed_progress_scale)
+            if fixed_progress_scale is not None
+            else float(max(0.05, min(1.0, step_penalty)))
+        )
 
     return RuntimeParameters(
         max_steps=max_steps,
@@ -62,6 +79,9 @@ def derive_runtime_parameters(
         goal_reward=base_goal_reward,
         scale_used=scale,
         progress_scale=progress_scale,
+        allow_diagonal_actions=allow_diagonal_actions,
+        view_mode=normalized_view_mode,
+        view_radius=view_radius,
     )
 
 
@@ -83,6 +103,7 @@ def load_runtime_from_metadata(
         return None
 
     try:
+        loaded_view_mode = str(runtime.get("view_mode", "window")).strip().lower()
         return RuntimeParameters(
             max_steps=int(runtime["max_steps"]),
             step_penalty=float(runtime["step_penalty"]),
@@ -90,6 +111,9 @@ def load_runtime_from_metadata(
             goal_reward=float(runtime.get("goal_reward", 1.0)),
             scale_used=float(runtime.get("scale_used", 0.0)),
             progress_scale=float(runtime.get("progress_scale", 0.1)),
+            allow_diagonal_actions=bool(runtime.get("allow_diagonal_actions", True)),
+            view_mode=loaded_view_mode,
+            view_radius=int(runtime.get("view_radius", 5)),
         )
     except (TypeError, ValueError, KeyError):
         return None

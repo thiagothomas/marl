@@ -23,6 +23,11 @@ class EvaluationConfig:
     rollouts: int = 5
     device: str = "cpu"
     max_steps_scale: Optional[float] = None
+    allow_diagonal_actions: bool = True
+    view_mode: str = "moore"
+    view_radius: int = 1
+    fixed_step_penalty: Optional[float] = 0.01
+    fixed_progress_scale: Optional[float] = 0.2
 
 
 def evaluate_map_scenarios(config: EvaluationConfig) -> List[Dict[str, float]]:
@@ -41,6 +46,9 @@ def evaluate_map_scenarios(config: EvaluationConfig) -> List[Dict[str, float]]:
                 invalid_penalty=runtime.invalid_penalty,
                 goal_reward=runtime.goal_reward,
                 progress_scale=runtime.progress_scale,
+                allow_diagonal_actions=runtime.allow_diagonal_actions,
+                view_mode=runtime.view_mode,
+                view_radius=runtime.view_radius,
             )
 
         agent = PPOAgent(
@@ -97,9 +105,25 @@ def _resolve_runtime_parameters(config: EvaluationConfig, scenario: Scenario) ->
     metadata_runtime = load_runtime_from_metadata(policy_dir / "config.json", scenario)
 
     if config.max_steps_scale is not None:
-        return derive_runtime_parameters(scenario, config.max_steps_scale)
+        return derive_runtime_parameters(
+            scenario,
+            config.max_steps_scale,
+            allow_diagonal_actions=config.allow_diagonal_actions,
+            view_mode=config.view_mode,
+            view_radius=config.view_radius,
+            fixed_step_penalty=config.fixed_step_penalty,
+            fixed_progress_scale=config.fixed_progress_scale,
+        )
 
     if metadata_runtime is not None:
         return metadata_runtime
 
-    return derive_runtime_parameters(scenario, None)
+    return derive_runtime_parameters(
+        scenario,
+        None,
+        allow_diagonal_actions=config.allow_diagonal_actions,
+        view_mode=config.view_mode,
+        view_radius=config.view_radius,
+        fixed_step_penalty=config.fixed_step_penalty,
+        fixed_progress_scale=config.fixed_progress_scale,
+    )

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Callable
 import gymnasium as gym
 from .base_agent import RLAgent
 from .ac_model import ACModel
@@ -21,16 +21,22 @@ class PPOAgent(RLAgent):
         goal_hypothesis: str,
         episodes: int = 100000,
         learning_rate: float = 3e-4,
-        gamma: float = 0.99,
+        gamma: float = 0.995,
         clip_eps: float = 0.2,
         epochs: int = 4,
-        batch_size: int = 32,
+        batch_size: int = 256,
         gae_lambda: float = 0.95,
-        entropy_coef: float = 0.01,
+        entropy_coef: float = 3e-3,
+        entropy_coef_final: Optional[float] = 1e-3,
+        entropy_anneal_fraction: float = 0.8,
         value_loss_coef: float = 0.5,
         max_grad_norm: float = 0.5,
-        rollout_length: int = 128,
+        rollout_length: int = 256,
+        num_envs: int = 8,
         device: Optional[str] = None,
+        model_architecture: Optional[str] = None,
+        model_hidden_size: Optional[int] = None,
+        model_input_dim: Optional[int] = None,
         **kwargs
     ):
         """Initialize PPO agent.
@@ -49,7 +55,8 @@ class PPOAgent(RLAgent):
             entropy_coef: Entropy coefficient
             value_loss_coef: Value loss coefficient
             max_grad_norm: Maximum gradient norm for clipping
-            rollout_length: Length of rollout before update
+            rollout_length: Steps per environment to collect before each update
+            num_envs: Number of parallel environments to sample per rollout
             device: Device to use (cpu/cuda)
         """
         super().__init__(
@@ -67,10 +74,20 @@ class PPOAgent(RLAgent):
         self.epochs = epochs
         self.batch_size = batch_size
         self.gae_lambda = gae_lambda
-        self.entropy_coef = entropy_coef
+        self.entropy_coef_initial = float(entropy_coef)
+        self.entropy_coef_final = (
+            float(entropy_coef) if entropy_coef_final is None else float(entropy_coef_final)
+        )
+        self.entropy_anneal_fraction = float(np.clip(entropy_anneal_fraction, 0.0, 1.0))
+        self.entropy_coef = self.entropy_coef_initial
         self.value_loss_coef = value_loss_coef
         self.max_grad_norm = max_grad_norm
         self.rollout_length = rollout_length
+
+        # Store model configuration hints (may be overridden when loading checkpoints)
+        self.model_architecture = model_architecture or "expanded"
+        self.model_hidden_size = model_hidden_size
+        self.model_input_dim = model_input_dim
 
         # Set device
         if device is None:
@@ -78,27 +95,41 @@ class PPOAgent(RLAgent):
         else:
             self.device = torch.device(device)
 
-        # Create environment
-        if isinstance(env_name, str):
-            self.env = gym.make(env_name)
-        else:
-            self.env = env_name()
+        self.num_envs = max(1, int(num_envs))
+
+        def _make_env() -> gym.Env:
+            if isinstance(env_name, str):
+                return gym.make(env_name)
+            env_ctor: Callable[[], gym.Env] = env_name
+            return env_ctor()
+
+        self.envs = [_make_env() for _ in range(self.num_envs)]
+        self.env = self.envs[0]
 
         # Create model
         self.model = ACModel(
             obs_space=self.env.observation_space,
-            action_space=self.env.action_space
+            action_space=self.env.action_space,
+            hidden_size=self.model_hidden_size,
+            architecture=self.model_architecture,
+            input_dim=self.model_input_dim
         ).to(self.device)
+        # Persist the actual parameters the model ended up using.
+        self.model_architecture = self.model.architecture
+        self.model_hidden_size = self.model.hidden_size
+        self.model_input_dim = self.model.input_dim
 
         # Create optimizer
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
         # Storage for rollouts
         self.reset_rollout_storage()
-        self._current_episode_return = 0.0
-        self._current_episode_length = 0
+        self._current_episode_return = np.zeros(self.num_envs, dtype=np.float32)
+        self._current_episode_length = np.zeros(self.num_envs, dtype=np.int32)
         self.total_steps = 0
         self.total_successes = 0
+        self.episodes_completed = 0
+        self.current_obs = np.stack([env.reset()[0] for env in self.envs])
 
     def reset_rollout_storage(self):
         """Reset storage for rollout data."""
@@ -112,122 +143,129 @@ class PPOAgent(RLAgent):
         self.rollout_episode_lengths = []
         self.rollout_successes = 0
 
-    def collect_rollout(self, num_steps: int) -> Tuple[List, List, List, List, List, List]:
+    def collect_rollout(self, num_steps: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Collect rollout data.
 
         Args:
             num_steps: Number of steps to collect
 
         Returns:
-            Tuple of buffers: (obs, actions, rewards, dones, values, log_probs)
+            Tuple of numpy arrays with shapes:
+                obs: (num_steps, num_envs, obs_dim)
+                actions: (num_steps, num_envs)
+                rewards: (num_steps, num_envs)
+                dones: (num_steps, num_envs)
+                values: (num_steps, num_envs)
+                log_probs: (num_steps, num_envs)
         """
-        obs = self.current_obs
+        obs_batch = self.current_obs.copy()
 
         for _ in range(num_steps):
-            # Convert observation to tensor
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+            obs_tensor = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
 
-            # Get action from policy
             with torch.no_grad():
                 dist, value = self.model(obs_tensor)
-                action = dist.sample()
-                log_prob = dist.log_prob(action)
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions)
 
-            # Execute action in environment
-            next_obs, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy()[0])
-            done = terminated or truncated
+            actions_np = actions.cpu().numpy()
+            log_probs_np = log_probs.cpu().numpy()
+            values_np = value.squeeze(-1).cpu().numpy()
 
-            # Store transition
-            self.obs_buffer.append(obs)
-            self.action_buffer.append(action.cpu().numpy()[0])
-            self.reward_buffer.append(reward)
-            self.done_buffer.append(done)
-            self.value_buffer.append(value.cpu().numpy()[0, 0])
-            self.log_prob_buffer.append(log_prob.cpu().numpy()[0])
+            rewards_np = np.zeros(self.num_envs, dtype=np.float32)
+            dones_np = np.zeros(self.num_envs, dtype=bool)
+            next_obs_batch = np.zeros_like(obs_batch)
 
-            # Track state for coverage
-            self.track_state(obs)
+            for env_idx, env in enumerate(self.envs):
+                next_obs, reward, terminated, truncated, _ = env.step(int(actions_np[env_idx]))
+                done = bool(terminated or truncated)
 
-            # Accumulate episode statistics
-            self._current_episode_return += reward
-            self._current_episode_length += 1
-            self.total_steps += 1
+                rewards_np[env_idx] = float(reward)
+                dones_np[env_idx] = done
+                self._current_episode_return[env_idx] += float(reward)
+                self._current_episode_length[env_idx] += 1
+                self.total_steps += 1
 
-            # Update observation
-            obs = next_obs
+                self.track_state(obs_batch[env_idx])
 
-            # Reset if done
-            if done:
-                if terminated:
-                    self.rollout_successes += 1
-                    self.total_successes += 1
-                self.rollout_episode_returns.append(self._current_episode_return)
-                self.rollout_episode_lengths.append(self._current_episode_length)
-                self._current_episode_return = 0.0
-                self._current_episode_length = 0
-                obs, _ = self.env.reset()
-                self.episodes_completed += 1
+                if done:
+                    if terminated:
+                        self.rollout_successes += 1
+                        self.total_successes += 1
+                    self.rollout_episode_returns.append(self._current_episode_return[env_idx])
+                    self.rollout_episode_lengths.append(self._current_episode_length[env_idx])
+                    self._current_episode_return[env_idx] = 0.0
+                    self._current_episode_length[env_idx] = 0
+                    reset_obs, _ = env.reset()
+                    next_obs_batch[env_idx] = reset_obs
+                    self.episodes_completed += 1
+                else:
+                    next_obs_batch[env_idx] = next_obs
 
-        self.current_obs = obs
+            self.obs_buffer.append(obs_batch.copy())
+            self.action_buffer.append(actions_np.astype(np.int64))
+            self.reward_buffer.append(rewards_np.copy())
+            self.done_buffer.append(dones_np.copy())
+            self.value_buffer.append(values_np.copy())
+            self.log_prob_buffer.append(log_probs_np.copy())
+
+            obs_batch = next_obs_batch
+            self.current_obs = obs_batch.copy()
 
         return (
-            self.obs_buffer.copy(),
-            self.action_buffer.copy(),
-            self.reward_buffer.copy(),
-            self.done_buffer.copy(),
-            self.value_buffer.copy(),
-            self.log_prob_buffer.copy()
+            np.stack(self.obs_buffer),
+            np.stack(self.action_buffer),
+            np.stack(self.reward_buffer),
+            np.stack(self.done_buffer),
+            np.stack(self.value_buffer),
+            np.stack(self.log_prob_buffer)
         )
 
     def compute_gae(
         self,
-        rewards: List[float],
-        values: List[float],
-        dones: List[bool]
+        rewards: np.ndarray,
+        values: np.ndarray,
+        dones: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Compute Generalized Advantage Estimation.
 
         Args:
-            rewards: List of rewards
-            values: List of value estimates
-            dones: List of done flags
+            rewards: Reward matrix of shape (num_steps, num_envs)
+            values: Value predictions of shape (num_steps, num_envs)
+            dones: Done mask of shape (num_steps, num_envs)
 
         Returns:
-            advantages: Advantage estimates
-            returns: Return estimates
+            advantages: Flattened, normalized advantages
+            returns: Flattened returns aligned with advantages
         """
-        advantages = []
-        gae = 0
+        rewards_arr = np.asarray(rewards, dtype=np.float32)
+        values_arr = np.asarray(values, dtype=np.float32)
+        dones_arr = np.asarray(dones, dtype=bool)
 
-        # Add bootstrap value for last state
+        num_steps, num_envs = rewards_arr.shape
+
         with torch.no_grad():
-            last_obs_tensor = torch.FloatTensor(self.current_obs).unsqueeze(0).to(self.device)
-            _, last_value = self.model(last_obs_tensor)
-            last_value = last_value.cpu().numpy()[0, 0]
+            last_obs_tensor = torch.as_tensor(self.current_obs, dtype=torch.float32, device=self.device)
+            _, last_value_tensor = self.model(last_obs_tensor)
+            last_values = last_value_tensor.squeeze(-1).cpu().numpy()
 
-        values = values + [last_value]
+        values_ext = np.concatenate([values_arr, last_values[None, :]], axis=0)
 
-        # Compute GAE
-        for t in reversed(range(len(rewards))):
-            if dones[t]:
-                delta = rewards[t] - values[t]
-                gae = delta
-            else:
-                delta = rewards[t] + self.gamma * values[t + 1] - values[t]
-                gae = delta + self.gamma * self.gae_lambda * gae
+        advantages = np.zeros_like(rewards_arr)
+        gae = np.zeros(num_envs, dtype=np.float32)
 
-            advantages.append(gae)
+        for t in reversed(range(num_steps)):
+            mask = 1.0 - dones_arr[t].astype(np.float32)
+            delta = rewards_arr[t] + self.gamma * values_ext[t + 1] * mask - values_ext[t]
+            gae = delta + self.gamma * self.gae_lambda * gae * mask
+            advantages[t] = gae
 
-        advantages = advantages[::-1]
-        advantages = np.array(advantages)
+        returns = advantages + values_arr
 
-        # Compute returns
-        returns = advantages + np.array(values[:-1])
+        flat_advantages = advantages.reshape(-1)
+        flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
 
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        return advantages, returns
+        return flat_advantages, returns.reshape(-1)
 
     def update_policy(
         self,
@@ -295,78 +333,113 @@ class PPOAgent(RLAgent):
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
-    def learn(self):
-        """Train the PPO agent."""
+    def learn(self) -> bool:
+        """Train the PPO agent.
+
+        Returns:
+            True if training ran to completion, False if interrupted by the user.
+        """
         print(f"Training PPO agent for goal: {self.goal_hypothesis}")
         max_steps = getattr(self.env, "max_steps", None)
         runtime_info = f", Max Steps: {max_steps}" if max_steps is not None else ""
+        total_batch = self.rollout_length * self.num_envs
         print(
-            f"Episodes: {self.episodes}, Device: {self.device}, Rollout: {self.rollout_length}, "
+            f"Episodes: {self.episodes}, Device: {self.device}, Envs: {self.num_envs}, "
+            f"Rollout/Env: {self.rollout_length}, Batch: {total_batch}, "
             f"LR: {self.learning_rate}, Gamma: {self.gamma}, Clip: {self.clip_eps}{runtime_info}"
         )
 
         # Initialize environment
-        self.current_obs, _ = self.env.reset()
+        self.current_obs = np.stack([env.reset()[0] for env in self.envs])
         self.episodes_completed = 0
-        self._current_episode_return = 0.0
-        self._current_episode_length = 0
+        self._current_episode_return = np.zeros(self.num_envs, dtype=np.float32)
+        self._current_episode_length = np.zeros(self.num_envs, dtype=np.int32)
         self.total_steps = 0
         self.total_successes = 0
 
-        # Training loop
-        num_updates = self.episodes // (self.rollout_length // 100)  # Approximate
+        rollout_scale = max(1, self.rollout_length // 100)
+        num_updates = max(1, self.episodes // rollout_scale)
+        if self.entropy_coef_initial != self.entropy_coef_final:
+            anneal_updates = max(1, int(num_updates * self.entropy_anneal_fraction))
+        else:
+            anneal_updates = 0
 
-        for update in range(num_updates):
-            # Reset rollout storage
-            self.reset_rollout_storage()
+        interrupted = False
 
-            # Collect rollout
-            obs, actions, rewards, dones, values, log_probs = self.collect_rollout(self.rollout_length)
+        try:
+            for update in range(num_updates):
+                if anneal_updates > 0:
+                    if update <= anneal_updates:
+                        alpha = update / anneal_updates
+                        self.entropy_coef = (
+                            (1.0 - alpha) * self.entropy_coef_initial
+                            + alpha * self.entropy_coef_final
+                        )
+                    else:
+                        self.entropy_coef = self.entropy_coef_final
+                # Reset rollout storage
+                self.reset_rollout_storage()
 
-            # Compute advantages and returns
-            advantages, returns = self.compute_gae(rewards, values, dones)
+                # Collect rollout
+                obs, actions, rewards, dones, values, log_probs = self.collect_rollout(self.rollout_length)
 
-            # Update policy
-            self.update_policy(
-                np.array(obs),
-                np.array(actions),
-                np.array(log_probs),
-                advantages,
-                returns
-            )
+                # Compute advantages and returns
+                advantages, returns = self.compute_gae(rewards, values, dones)
 
-            # Print progress
-            if update % 100 == 0:
-                mean_reward = np.mean(rewards)
-                if self.rollout_episode_returns:
-                    mean_return = np.mean(self.rollout_episode_returns)
-                    mean_length = np.mean(self.rollout_episode_lengths)
-                    success_rate = self.rollout_successes / len(self.rollout_episode_returns)
-                else:
-                    mean_return = float(np.sum(rewards))
-                    mean_length = float(self._current_episode_length)
-                    success_rate = 0.0
-                max_steps = getattr(self.env, "max_steps", None)
-                max_steps_info = f", Max Steps: {max_steps}" if max_steps is not None else ""
-                print(
-                    f"Update {update}/{num_updates}, Episodes: {self.episodes_completed}, "
-                    f"Mean Reward: {mean_reward:.3f}, "
-                    f"Mean Return: {mean_return:.3f}, "
-                    f"Success Rate: {success_rate:.2%}, "
-                    f"Avg Len: {mean_length:.1f}, "
-                    f"Total Successes: {self.total_successes}, "
-                    f"Total Steps: {self.total_steps}"
-                    f"{max_steps_info}, States Seen: {len(self.states_counter)}"
+                # Update policy
+                flat_obs = obs.reshape(obs.shape[0] * obs.shape[1], -1)
+                flat_actions = actions.reshape(-1)
+                flat_log_probs = log_probs.reshape(-1)
+                self.update_policy(
+                    flat_obs,
+                    flat_actions,
+                    flat_log_probs,
+                    advantages,
+                    returns
                 )
 
-            # Save model periodically
-            if update % 1000 == 0:
-                self.save_model()
+                # Print progress
+                if update % 100 == 0:
+                    mean_reward = float(np.mean(rewards))
+                    if self.rollout_episode_returns:
+                        mean_return = np.mean(self.rollout_episode_returns)
+                        mean_length = np.mean(self.rollout_episode_lengths)
+                        success_rate = self.rollout_successes / max(1, len(self.rollout_episode_returns))
+                    else:
+                        mean_return = float(np.sum(rewards))
+                        mean_length = float(np.mean(self._current_episode_length))
+                        success_rate = 0.0
+                    max_steps = getattr(self.env, "max_steps", None)
+                    max_steps_info = f", Max Steps: {max_steps}" if max_steps is not None else ""
+                    print(
+                        f"Update {update}/{num_updates}, Episodes: {self.episodes_completed}, "
+                        f"Mean Reward: {mean_reward:.3f}, "
+                        f"Mean Return: {mean_return:.3f}, "
+                        f"Success Rate: {success_rate:.2%}, "
+                        f"Avg Len: {mean_length:.1f}, "
+                        f"Total Successes: {self.total_successes}, "
+                        f"Total Steps: {self.total_steps}, "
+                        f"EntropyCoef: {self.entropy_coef:.4g}"
+                        f"{max_steps_info}, States Seen: {len(self.states_counter)}"
+                    )
 
-        # Final save
-        self.save_model()
-        self.save_states_counter()
-        print(f"Training completed. Model saved to {self.model_path}")
+                # Save model periodically
+                if update % 200 == 0 and update != 0:
+                    self.save_model()
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\nTraining interrupted by user. Leaving existing checkpoint untouched.")
+        finally:
+            if interrupted:
+                # Still persist state visitation stats for analysis, but avoid overwriting weights.
+                self.save_states_counter()
+                print(f"Training interrupted. Last saved model (if any) remains at {self.model_path}")
+            else:
+                self.save_model()
+                self.save_states_counter()
+                print(f"Training completed. Model saved to {self.model_path}")
+
+        return not interrupted
 
     def get_action_probabilities(self, observation: np.ndarray) -> np.ndarray:
         """Get action probability distribution for an observation.
@@ -388,17 +461,98 @@ class PPOAgent(RLAgent):
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'episodes_completed': getattr(self, 'episodes_completed', 0),
-            'goal_hypothesis': self.goal_hypothesis
+            'goal_hypothesis': self.goal_hypothesis,
+            'model_architecture': self.model.architecture,
+            'model_hidden_size': self.model.hidden_size,
+            'model_input_dim': self.model.input_dim,
+            'model_obs_dim': self.model.obs_dim,
+            'entropy_coef_initial': self.entropy_coef_initial,
+            'entropy_coef_final': self.entropy_coef_final,
+            'entropy_anneal_fraction': self.entropy_anneal_fraction,
         }, model_file)
 
     def load_model(self):
         """Load a trained model."""
         model_file = os.path.join(self.model_path, "model.pt")
-        if os.path.exists(model_file):
-            checkpoint = torch.load(model_file, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            if hasattr(self, 'optimizer'):
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"Loaded model from {model_file}")
-        else:
+        if not os.path.exists(model_file):
             raise FileNotFoundError(f"No model found at {model_file}")
+
+        checkpoint = torch.load(model_file, map_location=self.device)
+        state_dict = checkpoint['model_state_dict']
+
+        architecture = checkpoint.get('model_architecture')
+        hidden_size = checkpoint.get('model_hidden_size')
+        input_dim = checkpoint.get('model_input_dim')
+
+        if architecture is None or hidden_size is None or input_dim is None:
+            architecture, hidden_size, input_dim = ACModel.infer_config_from_state_dict(state_dict)
+
+        # Rebuild the model with the appropriate configuration.
+        self.model = ACModel(
+            obs_space=self.env.observation_space,
+            action_space=self.env.action_space,
+            hidden_size=hidden_size,
+            architecture=architecture,
+            input_dim=input_dim
+        ).to(self.device)
+
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as err:
+            inferred_architecture, inferred_hidden_size, inferred_input_dim = ACModel.infer_config_from_state_dict(state_dict)
+            if (
+                inferred_architecture != architecture
+                or inferred_hidden_size != hidden_size
+                or inferred_input_dim != input_dim
+            ):
+                self.model = ACModel(
+                    obs_space=self.env.observation_space,
+                    action_space=self.env.action_space,
+                    hidden_size=inferred_hidden_size,
+                    architecture=inferred_architecture,
+                    input_dim=inferred_input_dim
+                ).to(self.device)
+                self.model.load_state_dict(state_dict)
+                architecture = inferred_architecture
+                hidden_size = inferred_hidden_size
+                input_dim = inferred_input_dim
+            else:
+                raise err
+
+        self.entropy_coef_initial = float(
+            checkpoint.get('entropy_coef_initial', self.entropy_coef_initial)
+        )
+        self.entropy_coef_final = float(
+            checkpoint.get('entropy_coef_final', self.entropy_coef_final)
+        )
+        self.entropy_anneal_fraction = float(
+            checkpoint.get('entropy_anneal_fraction', self.entropy_anneal_fraction)
+        )
+        self.entropy_coef = self.entropy_coef_final
+
+        # Persist resolved configuration.
+        self.model_architecture = architecture
+        self.model_hidden_size = hidden_size
+        self.model_input_dim = input_dim
+
+        # Recreate optimizer so its parameter groups match the model.
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+        optimizer_state = checkpoint.get('optimizer_state_dict')
+        if optimizer_state:
+            try:
+                self.optimizer.load_state_dict(optimizer_state)
+            except (ValueError, RuntimeError):
+                print(
+                    "Warning: optimizer state mismatch detected; using freshly initialized optimizer."
+                )
+
+        self.episodes_completed = checkpoint.get(
+            'episodes_completed',
+            getattr(self, 'episodes_completed', 0)
+        )
+
+        print(
+            f"Loaded model from {model_file} "
+            f"(architecture={architecture}, hidden_size={hidden_size}, input_dim={input_dim})"
+        )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import heapq
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
@@ -15,16 +15,19 @@ Action = int
 Coordinate = Tuple[int, int]
 
 
-ACTION_DELTAS: Dict[Action, Coordinate] = {
-    0: (0, -1),   # N
-    1: (1, -1),   # NE
-    2: (1, 0),    # E
-    3: (1, 1),    # SE
-    4: (0, 1),    # S
-    5: (-1, 1),   # SW
-    6: (-1, 0),   # W
-    7: (-1, -1),  # NW
-}
+CARDINAL_DELTAS: Tuple[Coordinate, ...] = (
+    (0, -1),   # N
+    (1, 0),    # E
+    (0, 1),    # S
+    (-1, 0),   # W
+)
+
+DIAGONAL_DELTAS: Tuple[Coordinate, ...] = (
+    (1, -1),   # NE
+    (1, 1),    # SE
+    (-1, 1),   # SW
+    (-1, -1),  # NW
+)
 
 
 class StarCraftScenarioEnv(gym.Env):
@@ -45,6 +48,9 @@ class StarCraftScenarioEnv(gym.Env):
         invalid_penalty: Optional[float] = None,
         goal_reward: float = 1.0,
         progress_scale: float = 0.1,
+        view_radius: int = 1,
+        allow_diagonal_actions: bool = False,
+        view_mode: str = "cardinal",
     ) -> None:
         if grid.dtype != bool:
             raise ValueError("grid must be a boolean numpy array indicating walkable tiles")
@@ -54,6 +60,32 @@ class StarCraftScenarioEnv(gym.Env):
         self.height, self.width = grid.shape
         self.goal_reward = goal_reward
         self.progress_scale = progress_scale
+        self.view_mode = view_mode.strip().lower()
+
+        if allow_diagonal_actions:
+            self._action_deltas: Sequence[Coordinate] = CARDINAL_DELTAS + DIAGONAL_DELTAS
+        else:
+            self._action_deltas = CARDINAL_DELTAS
+        self._action_map: Dict[Action, Coordinate] = {
+            idx: delta for idx, delta in enumerate(self._action_deltas)
+        }
+
+        if self.view_mode == "cardinal":
+            self.view_radius = 1
+            self.view_diameter = 1
+            self.view_area = 4
+        elif self.view_mode in {"moore", "3x3"}:
+            self.view_radius = 1
+            self.view_diameter = 3
+            self.view_area = 9
+        elif self.view_mode in {"window", "square", "full"}:
+            self.view_radius = max(int(view_radius), 0)
+            self.view_diameter = self.view_radius * 2 + 1
+            self.view_area = self.view_diameter * self.view_diameter
+        else:
+            raise ValueError(
+                "view_mode must be one of {'cardinal', 'moore', '3x3', 'window', 'square', 'full'}"
+            )
 
         if max_steps is None:
             computed_steps = max_steps_scale * max(1.0, scenario.optimal_length)
@@ -61,18 +93,18 @@ class StarCraftScenarioEnv(gym.Env):
         else:
             self.max_steps = max(int(max_steps), 1)
 
-        self.step_penalty = float(step_penalty) if step_penalty is not None else 1.0 / self.max_steps
-        self.invalid_penalty = (
-            float(invalid_penalty) if invalid_penalty is not None else self.step_penalty * 4.0
-        )
+        if step_penalty is None:
+            self.step_penalty = 0.01
+        else:
+            self.step_penalty = float(step_penalty)
+        if invalid_penalty is None:
+            self.invalid_penalty = 4.0 * self.step_penalty
+        else:
+            self.invalid_penalty = float(invalid_penalty)
 
-        self.action_space = spaces.Discrete(len(ACTION_DELTAS))
-        self.observation_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(4,),
-            dtype=np.float32,
-        )
+        self.action_space = spaces.Discrete(len(self._action_deltas))
+        obs_size = 4 + self.view_area
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32)
 
         self._position = np.array([scenario.start[0], scenario.start[1]], dtype=np.int32)
         self._steps = 0
@@ -89,7 +121,7 @@ class StarCraftScenarioEnv(gym.Env):
 
     def step(self, action: Action):
         self._steps += 1
-        dx, dy = ACTION_DELTAS.get(int(action), (0, 0))
+        dx, dy = self._action_map.get(int(action), (0, 0))
         new_x = int(self._position[0] + dx)
         new_y = int(self._position[1] + dy)
 
@@ -128,7 +160,8 @@ class StarCraftScenarioEnv(gym.Env):
         py = self._position[1] / (self.height - 1)
         gx = self.scenario.goal[0] / (self.width - 1)
         gy = self.scenario.goal[1] / (self.height - 1)
-        return np.array([px, py, gx, gy], dtype=np.float32)
+        local_patch = self._get_local_patch(self._position[0], self._position[1])
+        return np.concatenate((np.array([px, py, gx, gy], dtype=np.float32), local_patch))
 
     def _valid_position(self, x: int, y: int) -> bool:
         if x < 0 or y < 0 or x >= self.width or y >= self.height:
@@ -150,12 +183,12 @@ class StarCraftScenarioEnv(gym.Env):
             if dist > distance[y, x]:
                 continue
 
-            for dx, dy in ACTION_DELTAS.values():
+            for dx, dy in self._action_deltas:
                 nx, ny = x + dx, y + dy
                 if not self._valid_position(nx, ny):
                     continue
 
-                step_cost = math.sqrt(2) if dx != 0 and dy != 0 else 1.0
+                step_cost = math.sqrt(2.0) if dx != 0 and dy != 0 else 1.0
                 new_dist = dist + step_cost
                 if new_dist < distance[ny, nx]:
                     distance[ny, nx] = new_dist
@@ -167,3 +200,40 @@ class StarCraftScenarioEnv(gym.Env):
         if x < 0 or y < 0 or x >= self.width or y >= self.height:
             return float("inf")
         return float(self._distance_map[y, x])
+
+    def _get_local_patch(self, center_x: int, center_y: int) -> np.ndarray:
+        """
+        Flattened occupancy window around the agent. Walkable tiles are 1.0, blocked or out-of-bounds are 0.0.
+        """
+        if self.view_mode == "cardinal":
+            patch = np.zeros(4, dtype=np.float32)
+            for idx, (dx, dy) in enumerate(CARDINAL_DELTAS):
+                x = center_x + dx
+                y = center_y + dy
+                if 0 <= x < self.width and 0 <= y < self.height and self.grid[y, x]:
+                    patch[idx] = 1.0
+            return patch
+
+        if self.view_mode in {"moore", "3x3"}:
+            patch = np.zeros((3, 3), dtype=np.float32)
+            for local_y, dy in enumerate(range(-1, 2)):
+                for local_x, dx in enumerate(range(-1, 2)):
+                    x = center_x + dx
+                    y = center_y + dy
+                    if 0 <= x < self.width and 0 <= y < self.height and self.grid[y, x]:
+                        patch[local_y, local_x] = 1.0
+            return patch.reshape(-1)
+
+        if self.view_radius == 0:
+            if 0 <= center_x < self.width and 0 <= center_y < self.height and self.grid[center_y, center_x]:
+                return np.array([1.0], dtype=np.float32)
+            return np.array([0.0], dtype=np.float32)
+
+        patch = np.zeros((self.view_diameter, self.view_diameter), dtype=np.float32)
+        for dy in range(-self.view_radius, self.view_radius + 1):
+            for dx in range(-self.view_radius, self.view_radius + 1):
+                x = center_x + dx
+                y = center_y + dy
+                if 0 <= x < self.width and 0 <= y < self.height and self.grid[y, x]:
+                    patch[dy + self.view_radius, dx + self.view_radius] = 1.0
+        return patch.reshape(-1)

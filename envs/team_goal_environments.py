@@ -11,6 +11,9 @@ against these trained policies to determine team membership and goals.
 from .grid_world import GridWorldBase
 import numpy as np
 
+STEP_PENALTY = 0.01
+DISTANCE_WEIGHT = 0.01
+
 
 class TeamGoalTopRight(GridWorldBase):
     """Environment for training agents to reach top-right (Team A's goal)."""
@@ -23,10 +26,8 @@ class TeamGoalTopRight(GridWorldBase):
         """Reward for reaching top-right corner."""
         if self._is_goal_reached():
             return 10.0  # Big reward for reaching goal
-        else:
-            # Small negative reward proportional to distance
-            distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
-            return -0.01 * distance
+        distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
+        return -(STEP_PENALTY + DISTANCE_WEIGHT * distance)
 
 
 class TeamGoalTopLeft(GridWorldBase):
@@ -40,9 +41,8 @@ class TeamGoalTopLeft(GridWorldBase):
         """Reward for reaching top-left corner."""
         if self._is_goal_reached():
             return 10.0
-        else:
-            distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
-            return -0.01 * distance
+        distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
+        return -(STEP_PENALTY + DISTANCE_WEIGHT * distance)
 
 
 class TeamGoalBottomRight(GridWorldBase):
@@ -56,9 +56,8 @@ class TeamGoalBottomRight(GridWorldBase):
         """Reward for reaching bottom-right corner."""
         if self._is_goal_reached():
             return 10.0
-        else:
-            distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
-            return -0.01 * distance
+        distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
+        return -(STEP_PENALTY + DISTANCE_WEIGHT * distance)
 
 
 class TeamGoalBottomLeft(GridWorldBase):
@@ -72,7 +71,5 @@ class TeamGoalBottomLeft(GridWorldBase):
         """Reward for reaching bottom-left corner."""
         if self._is_goal_reached():
             return 10.0
-        else:
-            distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
-            return -0.01 * distance
-
+        distance = np.linalg.norm(self.agent_pos.astype(float) - self.goal_pos.astype(float))
+        return -(STEP_PENALTY + DISTANCE_WEIGHT * distance)

@@ -38,22 +38,18 @@ from ml.ppo import PPOAgent
 
 Coordinate = Tuple[int, int]
 
+DEFAULT_MAPS_ROOT = Path("starcraft-maps")
+DEFAULT_MODELS_DIR = Path("models/starcraft")
+DEFAULT_DEVICE = "cpu"
+DEFAULT_STEP_INTERVAL_MS = 60
+DEFAULT_DETERMINISTIC = False
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize a trained StarCraft PPO policy on the map PNG."
     )
     parser.add_argument("--map-id", required=True, help="Map identifier (e.g., Aftershock).")
-    parser.add_argument(
-        "--maps-root",
-        default="starcraft-maps",
-        help="Directory containing sc1-map/, sc1-png/, and sc1-scen/ folders.",
-    )
-    parser.add_argument(
-        "--models-dir",
-        default="models/starcraft",
-        help="Directory where checkpoints were saved during training.",
-    )
     parser.add_argument(
         "--episodes",
         type=int,
@@ -64,28 +60,23 @@ def parse_args() -> argparse.Namespace:
         "--scenario-index",
         type=int,
         default=0,
-        help="Zero-based index into the scenario file (ignored if --scenario-id is set).",
+        help="Zero-based index into the scenario file.",
     )
     parser.add_argument(
-        "--scenario-id",
-        help="Exact scenario identifier to visualize (e.g., Aftershock_line_000).",
+        "--deterministic",
+        action="store_true",
+        default=DEFAULT_DETERMINISTIC,
+        help="Replay using greedy actions instead of sampling from the policy.",
     )
     parser.add_argument(
-        "--max-steps-scale",
-        type=float,
-        default=None,
-        help="Override the automatically derived episode horizon scale (defaults to training metadata).",
-    )
-    parser.add_argument(
-        "--step-interval",
+        "--step-interval-ms",
         type=int,
-        default=120,
-        help="Animation update interval in milliseconds.",
-    )
-    parser.add_argument(
-        "--device",
-        default="cpu",
-        help="Device for PPO inference (cpu or cuda).",
+        default=DEFAULT_STEP_INTERVAL_MS,
+        metavar="MS",
+        help=(
+            "Delay between visualization steps in milliseconds; "
+            "smaller values speed up the animation."
+        ),
     )
     return parser.parse_args()
 
@@ -97,10 +88,13 @@ class AgentRunner:
         self,
         agent: PPOAgent,
         env_factory: Callable[[], StarCraftScenarioEnv],
+        *,
+        deterministic: bool,
     ) -> None:
         self._env_factory = env_factory
         self._env = env_factory()
         self._agent = agent
+        self._deterministic = deterministic
 
         self._obs, info = self._env.reset()
         start_position = info.get("position")
@@ -115,12 +109,25 @@ class AgentRunner:
         self.steps = 0
         self.last_reward = 0.0
 
+    @property
+    def deterministic(self) -> bool:
+        return self._deterministic
+
     def step(self) -> Coordinate:
         if self.terminated or self.truncated:
             return self.positions[-1]
 
         action_probs = self._agent.get_action_probabilities(self._obs)
-        action = int(np.argmax(action_probs))
+        if self._deterministic:
+            action = int(np.argmax(action_probs))
+        else:
+            probs = np.asarray(action_probs, dtype=np.float64)
+            probs_sum = probs.sum()
+            if not np.isfinite(probs_sum) or probs_sum <= 0.0:
+                action = int(np.argmax(action_probs))
+            else:
+                probs = probs / probs_sum
+                action = int(np.random.choice(len(probs), p=probs))
 
         self._obs, reward, terminated, truncated, info = self._env.step(action)
         position = info.get("position")
@@ -265,7 +272,7 @@ class MapCanvas(QWidget):
         painter.drawEllipse(to_canvas(self._start), 6, 6)
 
         # Draw trajectory.
-        painter.setPen(QPen(QColor(255, 230, 80), 2))
+        painter.setPen(QPen(QColor(80, 160, 255), 2))
         last_point: QPointF | None = None
         for coordinate in self._positions:
             point = to_canvas(coordinate)
@@ -307,9 +314,11 @@ class VisualizerWindow(QMainWindow):
 
         self._status = QLabel(self)
         self._status.setStyleSheet("color: #EEEEEE; background-color: #222222; padding: 6px;")
+        run_mode = "deterministic" if runner.deterministic else "sampling"
         self._status_prefix = (
             f"Start ({start[0]}, {start[1]}) → goal ({goal[0]}, {goal[1]}) "
             f"| max_steps={runtime.max_steps} "
+            f"| mode={run_mode} "
             "| +/- or wheel to zoom, drag to pan, 0 to reset."
         )
 
@@ -363,7 +372,7 @@ class VisualizerWindow(QMainWindow):
 def main() -> None:
     args = parse_args()
 
-    maps_root = Path(args.maps_root)
+    maps_root = DEFAULT_MAPS_ROOT
     scen_path = maps_root / "sc1-scen" / f"{args.map_id}.map.scen"
     png_path = maps_root / "sc1-png" / f"{args.map_id}.png"
 
@@ -376,17 +385,8 @@ def main() -> None:
     if not scenarios:
         raise ValueError(f"No scenarios found in {scen_path}")
 
-    if args.scenario_id:
-        scenario = next((s for s in scenarios if s.scenario_id == args.scenario_id), None)
-        if scenario is None:
-            available = ", ".join(s.scenario_id for s in scenarios[:10])
-            raise ValueError(
-                f"Scenario id '{args.scenario_id}' not found. "
-                f"Examples from file: {available}..."
-            )
-    else:
-        index = max(0, min(args.scenario_index, len(scenarios) - 1))
-        scenario = scenarios[index]
+    index = max(0, min(args.scenario_index, len(scenarios) - 1))
+    scenario = scenarios[index]
 
     app = QApplication(sys.argv)
 
@@ -394,16 +394,20 @@ def main() -> None:
     if pixmap.isNull():
         raise RuntimeError(f"Failed to load PNG map from {png_path}")
 
-    models_dir = Path(args.models_dir) / args.map_id
+    models_dir = DEFAULT_MODELS_DIR / args.map_id
     policy_dir = models_dir / f"episodes_{args.episodes}" / scenario.scenario_id / "PPOAgent"
 
     metadata_runtime = load_runtime_from_metadata(policy_dir / "config.json", scenario)
-    if args.max_steps_scale is not None:
-        runtime = derive_runtime_parameters(scenario, args.max_steps_scale)
-    elif metadata_runtime is not None:
+    if metadata_runtime is not None:
         runtime = metadata_runtime
     else:
-        runtime = derive_runtime_parameters(scenario, None)
+        runtime = derive_runtime_parameters(
+            scenario,
+            None,
+            allow_diagonal_actions=True,
+            view_mode="moore",
+            view_radius=1,
+        )
 
     grid = load_grid(scenario.map_path)
 
@@ -416,6 +420,9 @@ def main() -> None:
             invalid_penalty=runtime.invalid_penalty,
             goal_reward=runtime.goal_reward,
             progress_scale=runtime.progress_scale,
+            allow_diagonal_actions=runtime.allow_diagonal_actions,
+            view_mode=runtime.view_mode,
+            view_radius=runtime.view_radius,
         )
 
     agent = PPOAgent(
@@ -423,7 +430,7 @@ def main() -> None:
         models_dir=str(models_dir),
         goal_hypothesis=scenario.scenario_id,
         episodes=args.episodes,
-        device=args.device,
+        device=DEFAULT_DEVICE,
     )
 
     try:
@@ -434,7 +441,11 @@ def main() -> None:
             f"Expected under {policy_dir}/"
         ) from exc
 
-    runner = AgentRunner(agent=agent, env_factory=env_factory)
+    runner = AgentRunner(
+        agent=agent,
+        env_factory=env_factory,
+        deterministic=args.deterministic,
+    )
 
     window = VisualizerWindow(
         map_pixmap=pixmap,
@@ -445,7 +456,7 @@ def main() -> None:
         grid_width=grid.shape[1],
         grid_height=grid.shape[0],
         runtime=runtime,
-        step_interval_ms=args.step_interval,
+        step_interval_ms=max(1, int(args.step_interval_ms)),
     )
     window.resize(720, 780)
     window.show()

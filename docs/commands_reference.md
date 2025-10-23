@@ -44,6 +44,9 @@ This guide lists the primary workflow commands, explains why and when to run the
   - `--scenario-count`: limit the number of scenarios (set to `0` to train all).  
   - `--scenario-index` / `--scenario-id`: train a specific scenario line instead of a range.  
   - `--max-steps-scale`: override the automatically derived horizon (defaults use scenario bucket and optimal distance). Progress-shaping rewards are scaled automatically from the same metadata.  
+  - Rollout length scales automatically with scenario horizon (128–4096 steps) so each PPO update sees several full episodes.  
+  - `--entropy-coef`: initial exploration bonus (decays toward zero automatically during training).  
+  - Agents default to 8-directional movement with a 3×3 occupancy patch; override via the StarCraft config if needed.  
   - `--device`: switch to `cuda` when GPUs are available.  
 - `python recognize_starcraft.py --map-id Aftershock --train-episodes 5000 --rollouts 10`  
   *Run when*: validating trained StarCraft policies before using them in recognition workflows.  

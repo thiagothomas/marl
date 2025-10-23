@@ -132,7 +132,12 @@ Interactive visualizer that shows:
   `models/starcraft/<map_id>/episodes_<episodes>/` and records the automatically
   derived horizon/penalty/shape settings. Use `--scenario-index` /
   `--scenario-id` to target specific lines, or `--max-steps-scale` to override
-  the auto scaling.
+  the auto scaling. Set `--entropy-coef` (default `1e-3`) to control the initial
+  exploration bonus; the trainer now anneals entropy toward zero over the run so
+  policies sharpen automatically. Progress shaping defaults to `0.2`, penalizing
+  dithering near goals more strongly. Rollout length is chosen automatically from
+  the scenario horizon (128 → 4096) so PPO batches contain several full episodes.
+  Agents now receive a 3×3 occupancy patch and can move in all eight directions by default.
   Use `--scenario-index` or `--scenario-id` to target a specific line.
 - Evaluate trained policies (for reuse in recognition) via
   ```bash

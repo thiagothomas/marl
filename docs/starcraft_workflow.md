@@ -19,6 +19,12 @@ Run `train_starcraft.py` to train one PPO agent per scenario:
 python train_starcraft.py --map-id Aftershock --episodes 5000 --scenario-count 10
 ```
 
+Use `--entropy-coef` (default `1e-3`) to adjust the initial PPO entropy bonus; the trainer now
+linearly anneals it toward zero so policies sharpen automatically. Rollout length is chosen from the
+scenario horizon (128–4096) so each PPO update captures several full episodes. Progress shaping
+defaults to `0.2`, making backtracking near goals carry a steeper penalty. Agents observe a 3×3
+occupancy window and have 8-directional movement enabled by default.
+
 Checkpoints are stored under `models/starcraft/<map_id>/episodes_<episodes>/`.
 Each scenario directory contains `model.pt` (the PPO weights) and `config.json`
 with the start/goal metadata plus the derived runtime parameters (max steps,

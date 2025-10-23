@@ -53,7 +53,8 @@ class MultiAgentGridWorld(gym.Env):
         render_mode: Optional[str] = None,
         initial_agent_positions: Optional[List[Tuple[int, int]]] = None,
         use_default_start_positions: bool = True,
-        start_preset: int = 0
+        start_preset: int = 0,
+        step_penalty: float = 0.01
     ):
         """Initialize the multi-agent grid world.
 
@@ -63,6 +64,7 @@ class MultiAgentGridWorld(gym.Env):
             team_sizes: List of number of agents per team [team1_size, team2_size, ...]
             team_goals: List of goal types for each team ['top_right', 'top_left', ...]
             render_mode: How to render the environment
+            step_penalty: Constant per-step penalty applied until success
         """
         super().__init__()
 
@@ -71,6 +73,7 @@ class MultiAgentGridWorld(gym.Env):
         self.render_mode = render_mode
         self.use_default_start_positions = use_default_start_positions
         self.start_preset = start_preset
+        self.step_penalty = float(step_penalty)
 
         # Default: 2 teams with 1 agent each
         self.team_sizes = team_sizes if team_sizes is not None else [1, 1]
@@ -336,7 +339,7 @@ class MultiAgentGridWorld(gym.Env):
                 distance = np.linalg.norm(
                     self.agent_positions[agent_id].astype(float) - goal_pos.astype(float)
                 )
-                reward = -0.01 * distance
+                reward = -(self.step_penalty + 0.01 * distance)
 
             rewards[f'agent_{agent_id}'] = reward
             terminateds[f'agent_{agent_id}'] = self.team_success[team_id]
