@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO policies for StarCraft map scenarios.")
     parser.add_argument("--map-id", required=True, help="Map identifier (e.g., Aftershock).")
     parser.add_argument(
+        "--scen-file",
+        type=Path,
+        default=None,
+        help="Optional override for the scenario file path. If omitted, defaults to starcraft-maps/sc1-scen/<map>.map.scen.",
+    )
+    parser.add_argument(
         "--episodes",
         type=int,
         default=5000,
@@ -93,7 +99,10 @@ def main() -> None:
     maps_root = DEFAULT_MAPS_ROOT
     models_dir = DEFAULT_MODELS_DIR
 
-    scen_path = maps_root / "sc1-scen" / f"{args.map_id}.map.scen"
+    scen_path = args.scen_file
+    if scen_path is None:
+        scen_path = maps_root / "sc1-scen" / f"{args.map_id}.map.scen"
+
     if not scen_path.exists():
         raise FileNotFoundError(f"Scenario file not found: {scen_path}")
 
@@ -101,11 +110,23 @@ def main() -> None:
     if not all_scenarios:
         raise ValueError(f"No scenarios found in {scen_path}")
 
+    scenario_map_ids = {scenario.map_id for scenario in all_scenarios}
+    if args.map_id not in scenario_map_ids:
+        raise ValueError(
+            f"Scenario file {scen_path} does not contain map '{args.map_id}'. "
+            f"Available map ids: {sorted(scenario_map_ids)}"
+        )
+
     if args.scenario_index < 0 or args.scenario_index >= len(all_scenarios):
         raise ValueError(
             f"Scenario index {args.scenario_index} out of range (0-{len(all_scenarios)-1})."
         )
     scenario = all_scenarios[args.scenario_index]
+    if scenario.map_id != args.map_id:
+        raise ValueError(
+            f"Scenario at index {args.scenario_index} in {scen_path} is for map "
+            f"'{scenario.map_id}', but --map-id requested '{args.map_id}'."
+        )
     runtime_preview = derive_runtime_parameters(
         scenario,
         None,

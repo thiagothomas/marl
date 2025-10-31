@@ -1,0 +1,42 @@
+{
+  "map_id": "Archipelago",
+  "map_path": "starcraft-maps/sc1-map/Archipelago.map",
+  "scenario_id": "Archipelago_line_1254",
+  "start": {
+    "x": 497,
+    "y": 488
+  },
+  "goal": {
+    "x": 272,
+    "y": 193
+  },
+  "episodes": 40000,
+  "bucket": 125,
+  "optimal_length": 500.98484802,
+  "max_steps_scale": null,
+  "entropy_coef": 0.003,
+  "entropy_coef_final": 0.001,
+  "entropy_anneal_fraction": 0.8,
+  "rollout_length": 512,
+  "target_rollout_length": null,
+  "num_envs": 8,
+  "requested_num_envs": null,
+  "total_batch_size": 4096,
+  "target_total_batch_size": null,
+  "min_rollout_length": 0,
+  "ppo_epochs": 4,
+  "minibatch_size": 256,
+  "requested_minibatch_size": null,
+  "runtime": {
+    "scenario_id": "Archipelago_line_1254",
+    "max_steps": 32064,
+    "step_penalty": 0.01,
+    "invalid_penalty": 0.04,
+    "goal_reward": 1.0,
+    "scale_used": 64.0,
+    "progress_scale": 0.2,
+    "allow_diagonal_actions": true,
+    "view_mode": "moore",
+    "view_radius": 1
+  }
+}

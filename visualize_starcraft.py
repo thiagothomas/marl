@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--map-id", required=True, help="Map identifier (e.g., Aftershock).")
     parser.add_argument(
+        "--scen-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional override for the scenario file path. "
+            "If omitted, defaults to starcraft-maps/sc1-scen/<map>.map.scen."
+        ),
+    )
+    parser.add_argument(
         "--episodes",
         type=int,
         default=5000,
@@ -77,6 +86,12 @@ def parse_args() -> argparse.Namespace:
             "Delay between visualization steps in milliseconds; "
             "smaller values speed up the animation."
         ),
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=DEFAULT_MODELS_DIR,
+        help="Base directory containing trained model checkpoints.",
     )
     return parser.parse_args()
 
@@ -373,7 +388,7 @@ def main() -> None:
     args = parse_args()
 
     maps_root = DEFAULT_MAPS_ROOT
-    scen_path = maps_root / "sc1-scen" / f"{args.map_id}.map.scen"
+    scen_path = args.scen_file if args.scen_file is not None else maps_root / "sc1-scen" / f"{args.map_id}.map.scen"
     png_path = maps_root / "sc1-png" / f"{args.map_id}.png"
 
     if not scen_path.exists():
@@ -385,8 +400,23 @@ def main() -> None:
     if not scenarios:
         raise ValueError(f"No scenarios found in {scen_path}")
 
-    index = max(0, min(args.scenario_index, len(scenarios) - 1))
-    scenario = scenarios[index]
+    scenario_map_ids = {scenario.map_id for scenario in scenarios}
+    if args.map_id not in scenario_map_ids:
+        raise ValueError(
+            f"Scenario file {scen_path} does not contain map '{args.map_id}'. "
+            f"Available map ids: {sorted(scenario_map_ids)}"
+        )
+
+    if args.scenario_index < 0 or args.scenario_index >= len(scenarios):
+        raise ValueError(
+            f"Scenario index {args.scenario_index} out of range (0-{len(scenarios)-1})."
+        )
+    scenario = scenarios[args.scenario_index]
+    if scenario.map_id != args.map_id:
+        raise ValueError(
+            f"Scenario at index {args.scenario_index} in {scen_path} is for map "
+            f"'{scenario.map_id}', but --map-id requested '{args.map_id}'."
+        )
 
     app = QApplication(sys.argv)
 
@@ -394,7 +424,7 @@ def main() -> None:
     if pixmap.isNull():
         raise RuntimeError(f"Failed to load PNG map from {png_path}")
 
-    models_dir = DEFAULT_MODELS_DIR / args.map_id
+    models_dir = Path(args.models_dir) / args.map_id
     policy_dir = models_dir / f"episodes_{args.episodes}" / scenario.scenario_id / "PPOAgent"
 
     metadata_runtime = load_runtime_from_metadata(policy_dir / "config.json", scenario)

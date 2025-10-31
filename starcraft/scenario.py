@@ -73,12 +73,6 @@ def load_scenarios(scen_path: Path, limit: Optional[int] = None) -> List[Scenari
     if scen_path.suffix != ".scen":
         raise ValueError(f"Scenario path must end with .scen (got {scen_path})")
 
-    map_filename = scen_path.stem
-    map_id = Path(map_filename).stem  # removes potential .map
-    map_path = scen_path.parent.parent / "sc1-map" / f"{map_id}.map"
-    if not map_path.exists():
-        raise FileNotFoundError(f"Map file {map_path} referenced by {scen_path} not found")
-
     with scen_path.open("r", encoding="utf-8") as handle:
         lines = [line.strip() for line in handle if line.strip()]
 
@@ -87,6 +81,21 @@ def load_scenarios(scen_path: Path, limit: Optional[int] = None) -> List[Scenari
 
     if not lines[0].startswith("version"):
         raise ValueError(f"Scenario file {scen_path} missing version header")
+
+    if len(lines) < 2:
+        raise ValueError(f"Scenario file {scen_path} contains no scenarios")
+
+    first_fields = lines[1].split()
+    if len(first_fields) != 9:
+        raise ValueError(
+            f"Scenario file {scen_path} first entry expected 9 fields, found {len(first_fields)}"
+        )
+
+    map_filename = first_fields[1]
+    map_id = Path(map_filename).stem
+    map_path = scen_path.parent.parent / "sc1-map" / map_filename
+    if not map_path.exists():
+        raise FileNotFoundError(f"Map file {map_path} referenced by {scen_path} not found")
 
     scenarios: List[Scenario] = []
     for idx, raw in enumerate(lines[1:]):
