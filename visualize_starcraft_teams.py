@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -45,6 +46,7 @@ DEFAULT_TEAMS_DIR = Path("models/starcraft/teams")
 DEFAULT_DEVICE = "cpu"
 DEFAULT_STEP_INTERVAL_MS = 60
 DEFAULT_DETERMINISTIC = False
+DEFAULT_RECOGNITION_NOISE = 0.0
 
 
 def assign_team_colors(team_names: Sequence[str]) -> Dict[str, QColor]:
@@ -139,6 +141,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="TEAM",
         help="Exclude specific team names. Can be repeated.",
+    )
+    parser.add_argument(
+        "--recognition-noise",
+        type=float,
+        default=DEFAULT_RECOGNITION_NOISE,
+        help=(
+            "Probability of randomly perturbing an observed action before recognition "
+            "to increase ambiguity (0.0–1.0)."
+        ),
     )
     return parser.parse_args()
 
@@ -407,6 +418,7 @@ class TeamsOverviewWidget(QWidget):
         step_interval_ms: int,
         *,
         recognition_callback: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+        recognition_noise: float = DEFAULT_RECOGNITION_NOISE,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -415,7 +427,7 @@ class TeamsOverviewWidget(QWidget):
         self._all_runners = [runner for runners in team_runners.values() for runner in runners]
         self._total_agents = len(self._all_runners)
         self._global_step = 0
-        self._recognition_engine = RecognitionEngine(team_runners)
+        self._recognition_engine = RecognitionEngine(team_runners, noise_rate=recognition_noise)
         self._recognition_callback: Optional[Callable[[List[Dict[str, Any]]], None]] = None
         pending_callback = recognition_callback
 
@@ -550,7 +562,7 @@ class TeamsOverviewWindow(QMainWindow):
 class RecognitionEngine:
     """Compute KL-divergence-based recognition assignments for observed agents."""
 
-    def __init__(self, team_runners: Dict[str, List[AgentRunner]]) -> None:
+    def __init__(self, team_runners: Dict[str, List[AgentRunner]], *, noise_rate: float = 0.0) -> None:
         self._team_runners = team_runners
         self._runners: List[AgentRunner] = [
             runner for runners in team_runners.values() for runner in runners
@@ -565,6 +577,7 @@ class RecognitionEngine:
             for runner in runners
         ]
         self._epsilon = 1e-9
+        self._noise = max(0.0, min(noise_rate, 1.0))
 
     def compute_results(self) -> List[Dict[str, Any]]:
         if not self._runners or not self._candidates:
@@ -577,6 +590,22 @@ class RecognitionEngine:
 
             observations = runner.observation_history[:-1]
             actions = runner.action_history
+            noisy_action_count = 0
+
+            if self._noise > 0.0 and observations:
+                reference_agent = self._candidates[0].agent
+                base_probs = reference_agent.get_action_probabilities(observations[0])
+                action_count = len(base_probs)
+                rng = random.Random(hash((runner.identifier, len(actions))))
+                noisy_actions = []
+                for action in actions:
+                    if rng.random() < self._noise and action_count > 0:
+                        noisy_action = rng.randrange(action_count)
+                        noisy_actions.append(noisy_action)
+                        noisy_action_count += 1
+                    else:
+                        noisy_actions.append(action)
+                actions = noisy_actions
 
             candidate_scores: List[Dict[str, Any]] = []
             for candidate in self._candidates:
@@ -638,6 +667,7 @@ class RecognitionEngine:
                     "top_hypotheses": top_hypotheses,
                     "steps_observed": len(actions),
                     "goal_probabilities": goal_probability_map,
+                    "noisy_actions": noisy_action_count,
                 }
             )
 
@@ -727,6 +757,7 @@ class RecognitionSidebar(QWidget):
         self._agent_table.setRowCount(len(results))
         correct_team_predictions = 0
         correct_goal_predictions = 0
+        total_noisy_actions = 0
         for row, info in enumerate(results):
             agent_item = QTableWidgetItem(info["agent_label"])
             actual_team_item = QTableWidgetItem(info["actual_team"])
@@ -776,6 +807,8 @@ class RecognitionSidebar(QWidget):
             else:
                 predicted_goal_item.setForeground(QColor("#ff6b6b"))
 
+            total_noisy_actions += int(info.get("noisy_actions", 0))
+
             self._agent_table.setItem(row, 0, agent_goal_item)
             self._agent_table.setItem(row, 1, actual_goal_item)
             self._agent_table.setItem(row, 2, predicted_goal_item)
@@ -790,7 +823,8 @@ class RecognitionSidebar(QWidget):
         )
         self._agent_summary.setText(
             f"Agents: {correct_goal_predictions}/{len(results)} goals correct "
-            f"({goal_accuracy:.1%}) — lower NLL is better."
+            f"({goal_accuracy:.1%}) — lower NLL is better. "
+            f"Perturbed steps tracked: {total_noisy_actions}"
         )
 
 
@@ -1046,6 +1080,7 @@ def main() -> None:
     map_label = next(iter(map_label_candidates)) if len(map_label_candidates) == 1 else map_path.stem
 
     sidebar = RecognitionSidebar()
+    recognition_noise = max(0.0, min(1.0, float(args.recognition_noise)))
 
     overview = TeamsOverviewWidget(
         team_runners=team_runners,
@@ -1055,6 +1090,7 @@ def main() -> None:
         grid_height=grid_height,
         step_interval_ms=max(1, int(args.step_interval_ms)),
         recognition_callback=sidebar.update_results,
+        recognition_noise=recognition_noise,
     )
     overview.setMinimumWidth(580)
     overview.set_recognition_callback(sidebar.update_results)
