@@ -105,6 +105,13 @@ class PPOAgent(RLAgent):
 
         self.envs = [_make_env() for _ in range(self.num_envs)]
         self.env = self.envs[0]
+        self.is_multi_discrete = isinstance(self.env.action_space, gym.spaces.MultiDiscrete)
+        if self.is_multi_discrete:
+            self.action_dim = len(self.env.action_space.nvec)
+            self.action_shape = (self.action_dim,)
+        else:
+            self.action_dim = 1
+            self.action_shape = ()
 
         # Create model
         self.model = ACModel(
@@ -152,7 +159,7 @@ class PPOAgent(RLAgent):
         Returns:
             Tuple of numpy arrays with shapes:
                 obs: (num_steps, num_envs, obs_dim)
-                actions: (num_steps, num_envs)
+                actions: (num_steps, num_envs[, num_agents])
                 rewards: (num_steps, num_envs)
                 dones: (num_steps, num_envs)
                 values: (num_steps, num_envs)
@@ -177,7 +184,10 @@ class PPOAgent(RLAgent):
             next_obs_batch = np.zeros_like(obs_batch)
 
             for env_idx, env in enumerate(self.envs):
-                next_obs, reward, terminated, truncated, _ = env.step(int(actions_np[env_idx]))
+                env_action = actions_np[env_idx]
+                if not self.is_multi_discrete:
+                    env_action = int(env_action)
+                next_obs, reward, terminated, truncated, _ = env.step(env_action)
                 done = bool(terminated or truncated)
 
                 rewards_np[env_idx] = float(reward)
@@ -388,7 +398,10 @@ class PPOAgent(RLAgent):
 
                 # Update policy
                 flat_obs = obs.reshape(obs.shape[0] * obs.shape[1], -1)
-                flat_actions = actions.reshape(-1)
+                if self.is_multi_discrete:
+                    flat_actions = actions.reshape(-1, self.action_dim)
+                else:
+                    flat_actions = actions.reshape(-1)
                 flat_log_probs = log_probs.reshape(-1)
                 self.update_policy(
                     flat_obs,
@@ -453,6 +466,20 @@ class PPOAgent(RLAgent):
         obs_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
         probs = self.model.get_action_probabilities(obs_tensor)
         return probs[0]
+
+    def act(self, observation: np.ndarray, deterministic: bool = False) -> np.ndarray:
+        """Sample (or greedily select) an action for evaluation."""
+        obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            dist, _ = self.model(obs_tensor)
+            if deterministic:
+                action = dist.mode()
+            else:
+                action = dist.sample()
+        action_np = action.squeeze(0).cpu().numpy()
+        if not self.is_multi_discrete:
+            return np.array(int(action_np), dtype=np.int64)
+        return action_np.astype(np.int64, copy=False)
 
     def save_model(self):
         """Save the trained model."""

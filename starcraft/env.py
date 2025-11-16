@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import math
 import heapq
-from typing import Dict, Tuple, Optional, Sequence
+from typing import Dict, Tuple, Optional, Sequence, List
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
 from .scenario import Scenario
+from .runtime import RuntimeParameters
 
 
 Action = int
@@ -237,3 +238,188 @@ class StarCraftScenarioEnv(gym.Env):
                 if 0 <= x < self.width and 0 <= y < self.height and self.grid[y, x]:
                     patch[dy + self.view_radius, dx + self.view_radius] = 1.0
         return patch.reshape(-1)
+
+
+class StarCraftTeamEnv(gym.Env):
+    """
+    Multi-agent wrapper that jointly trains a policy for multiple StarCraft scenarios.
+
+    The team environment concatenates per-agent observations from StarCraftScenarioEnv
+    instances and exposes a MultiDiscrete action space where each entry controls one
+    agent directly. The episode terminates successfully once all agents have reached
+    their respective goals. Episodes truncate when the shared step budget is
+    exhausted or when all agents finish without collectively succeeding.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        *,
+        grid: np.ndarray,
+        scenarios: Sequence[Scenario],
+        runtimes: Sequence[RuntimeParameters],
+        team_name: str = "team",
+        reward_mode: str = "sum",
+    ) -> None:
+        if not scenarios:
+            raise ValueError("StarCraftTeamEnv requires at least one agent scenario")
+        if len(scenarios) != len(runtimes):
+            raise ValueError("Number of scenarios must match number of runtime configs")
+        if grid.dtype != bool:
+            raise ValueError("grid must be a boolean numpy array indicating walkable tiles")
+
+        self.team_name = team_name
+        self.reward_mode = reward_mode.strip().lower()
+        if self.reward_mode not in {"sum", "mean"}:
+            raise ValueError("reward_mode must be either 'sum' or 'mean'")
+
+        self.num_agents = len(scenarios)
+        self._agent_envs: List[StarCraftScenarioEnv] = []
+        for scenario, runtime in zip(scenarios, runtimes):
+            env = StarCraftScenarioEnv(
+                grid=grid,
+                scenario=scenario,
+                max_steps=runtime.max_steps,
+                step_penalty=runtime.step_penalty,
+                invalid_penalty=runtime.invalid_penalty,
+                goal_reward=runtime.goal_reward,
+                progress_scale=runtime.progress_scale,
+                view_radius=runtime.view_radius,
+                allow_diagonal_actions=runtime.allow_diagonal_actions,
+                view_mode=runtime.view_mode,
+            )
+            self._agent_envs.append(env)
+
+        self._agent_obs: List[np.ndarray] = []
+        self._agent_done: List[bool] = []
+        self._agent_success: List[bool] = []
+        self._agent_last_info: List[Dict[str, object]] = []
+        self._agent_positions: List[Coordinate] = []
+
+        # Observation space concatenates each per-agent observation vector.
+        obs_dim = sum(env.observation_space.shape[0] for env in self._agent_envs)
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
+
+        base_actions = self._agent_envs[0].action_space
+        if not isinstance(base_actions, spaces.Discrete):
+            raise ValueError("Team env expects underlying scenarios to use Discrete actions")
+        self._joint_action_base = base_actions.n
+        self.action_space = spaces.MultiDiscrete(
+            np.full(self.num_agents, self._joint_action_base, dtype=np.int64)
+        )
+
+        self.max_steps = max(runtime.max_steps for runtime in runtimes)
+        self._steps = 0
+
+    # Gym API -------------------------------------------------------------
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed)
+        self._steps = 0
+        self._agent_done = [False] * self.num_agents
+        self._agent_success = [False] * self.num_agents
+        self._agent_obs = []
+        self._agent_last_info = []
+        self._agent_positions = []
+
+        for idx, env in enumerate(self._agent_envs):
+            env_seed = seed if idx == 0 else None
+            obs, info = env.reset(seed=env_seed)
+            self._agent_obs.append(np.array(obs, dtype=np.float32))
+            start_pos = tuple(info.get("position", env.scenario.start))
+            self._agent_positions.append(start_pos)
+            payload = dict(info or {})
+            payload.setdefault("position", start_pos)
+            self._agent_last_info.append(payload)
+
+        return self._concat_obs(), {"team_name": self.team_name}
+
+    def step(self, action):
+        self._steps += 1
+        decoded_actions = self._prepare_actions(action)
+        total_reward = 0.0
+        agent_infos: List[Dict[str, object]] = []
+
+        for idx, env in enumerate(self._agent_envs):
+            if self._agent_done[idx]:
+                cached = dict(self._agent_last_info[idx])
+                cached.setdefault("position", self._agent_positions[idx])
+                cached.setdefault("terminated", self._agent_success[idx])
+                cached.setdefault("truncated", not self._agent_success[idx])
+                cached["skipped"] = True
+                agent_infos.append(cached)
+                continue
+
+            obs, reward, terminated, truncated, info = env.step(decoded_actions[idx])
+            self._agent_obs[idx] = np.array(obs, copy=True)
+            total_reward += float(reward)
+            current_position = tuple(info.get("position", self._agent_positions[idx]))
+            self._agent_positions[idx] = current_position
+
+            if terminated:
+                self._agent_done[idx] = True
+                self._agent_success[idx] = True
+            elif truncated:
+                self._agent_done[idx] = True
+
+            payload = dict(info or {})
+            payload["terminated"] = terminated
+            payload["truncated"] = truncated
+            payload.setdefault("position", current_position)
+            self._agent_last_info[idx] = payload
+            agent_infos.append(payload)
+
+        if self.reward_mode == "mean":
+            total_reward /= float(self.num_agents)
+
+        all_finished = all(self._agent_done)
+        team_success = all_finished and all(self._agent_success)
+        terminated = team_success
+        truncated = False
+
+        if self._steps >= self.max_steps:
+            truncated = True
+        elif all_finished and not team_success:
+            truncated = True
+
+        info = {
+            "team_name": self.team_name,
+            "agent_info": agent_infos,
+            "team_success": team_success,
+            "steps": self._steps,
+        }
+
+        return self._concat_obs(), float(total_reward), terminated, truncated, info
+
+    def close(self):
+        for env in self._agent_envs:
+            env.close()
+        super().close()
+
+    # Internals -----------------------------------------------------------
+    def _concat_obs(self) -> np.ndarray:
+        if not self._agent_obs:
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
+        return np.concatenate(self._agent_obs).astype(np.float32, copy=False)
+
+    def _prepare_actions(self, action) -> List[int]:
+        if isinstance(action, (list, tuple, np.ndarray)):
+            arr = np.asarray(action, dtype=np.int64)
+            if arr.shape != (self.num_agents,):
+                raise ValueError(
+                    f"Expected action shape ({self.num_agents},), received {arr.shape}"
+                )
+            return arr.tolist()
+        return self._decode_joint_action(int(action))
+
+    def _decode_joint_action(self, action: int) -> List[int]:
+        action = int(action)
+        max_joint = int(self._joint_action_base ** self.num_agents) - 1
+        action = max(0, min(action, max_joint))
+        decoded: List[int] = []
+        base = self._joint_action_base
+        remainder = action
+        for _ in range(self.num_agents):
+            decoded.append(remainder % base)
+            remainder //= base
+        return decoded
